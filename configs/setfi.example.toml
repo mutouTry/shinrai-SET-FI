@@ -1,0 +1,271 @@
+# setfi configuration.
+# Relative paths are relative to this file. Keys marked REQUIRED have no default;
+# every other key may be deleted to use its default. "Used by" names the stages
+# that read the keys of a section (a key that differs says so): changing a key
+# re-runs them.
+
+# --------------------------------------------------------------------------------------
+# The design under test. Used by: build, record.
+[design]
+# Gate-level netlist (structural Verilog, named port connections).
+netlist = "design/mapped.v"   # REQUIRED
+# SDF of that netlist; its (DESIGN ...) must equal `top`. Used by: build.
+sdf = "design/mapped.sdf"   # REQUIRED
+# Top module of the netlist.
+top = "my_top"   # REQUIRED
+# Clock period T of the analysis: SET start times are uniform over [0, T) and flip-flops
+# capture at T. Normally the period the SDF was timed for; the testbench clock period
+# does not matter. Used by: inject.
+clock_period_ns = 1.0   # REQUIRED
+
+# --------------------------------------------------------------------------------------
+# Where everything is written. Used by: all stages.
+[output]
+# Output directory; one sub-directory per stage.
+dir = "runs/my_design"   # REQUIRED
+
+# --------------------------------------------------------------------------------------
+# The standard-cell library: cell logic and naming conventions. Used by: build.
+[library]
+# Logic of every cell: Liberty files (.lib) or Verilog cell modules (see docs/CELLS.md).
+cell_functions = ["lib/cells.lib"]   # REQUIRED
+# Names of flip-flop output pins (a sequential cell needs one).
+q_pins = ["Q", "QN", "QB", "Q_N", "QBAR"]
+# Names of flip-flop data pins; the first one a cell has is its data pin.
+d_pins = ["D", "DI", "DIN", "DATA", "I"]
+# Names of clock pins, used only for cells whose model does not name the clock in
+# `always @(posedge/negedge ...)` (e.g. latches).
+clock_pins = ["CP", "CK", "CLK", "CLKN", "G", "E"]
+# Names of asynchronous set/reset pins (never taken as the data pin).
+async_pins = ["RN", "SN", "R", "S", "RESET", "SET", "CDN", "SDN", "CLRN", "PRN"]
+# Data / scan-data pin pairs of scan flip-flops: when the SDF has setup/hold checks for
+# only one pin of a pair, they are copied to the other.
+scan_data_pin_pairs = [
+  { data = "D", scan = "SCD" },
+]
+# Enable the copying above.
+mirror_scan_data_checks = true
+# Regular expressions (whole cell name) of cells that have no SDF entry. Cells without
+# inputs or without outputs (ties, fillers) are always treated so.
+untimed_cells = []
+# Regular expressions (whole cell name) of cells that are neither in the library nor
+# defined in the netlist, e.g. memories. They are neither injected nor observed.
+blackbox_cells = []
+# Clock pins whose SDF SETUP/HOLD checks give a flip-flop's sampling window, in order of
+# preference; if none has checks, the one clock pin that has them is used. Used by:
+# build, inject.
+timing_check_clock_pins = ["CP", "CK", "CLK"]
+
+# --------------------------------------------------------------------------------------
+# The testbench, and how clock cycles are sampled from it. Used by: record.
+[workload]
+# Testbench source file(s). It instantiates the design, is run unchanged on the
+# gate-level netlist, and prints `pass_string` when it passes. It must not change design
+# inputs between a falling and the next rising clock edge (see docs/SIMULATORS.md).
+testbench = ["tb/testbench.sv"]   # REQUIRED
+# Top module of the testbench.
+tb_top = "testbench"
+# Instance name of the design in `tb_top`.
+dut_instance = "dut"
+# Clock signal in `tb_top`.
+clock = "clk"
+# Reset signal in `tb_top`; cycles are counted after reset. Empty: no reset, cycles are
+# counted from the first clock edge.
+reset = "rst_n"
+# Reset polarity. One of: low | high.
+reset_active = "low"
+# Verilog simulation models of the library cells, e.g. those shipped with the library.
+# Default: the cells of library.cell_functions (Liberty files as translated by build
+# into build/cell_functions.v).
+cell_sim_models = []
+# Files the testbench opens at run time; copied into the simulation directory.
+data_files = []
+# Directories searched for `include files, besides the directories of the testbench
+# files.
+include_dirs = []
+# Macro definitions, NAME or NAME=VALUE.
+defines = []
+# Number of clock cycles sampled from the run.
+n_cycles = 100
+# Seed of the cycle sampling.
+seed = 12345
+# Cycles not sampled at the start and end of the run.
+padding_cycles = 5
+# Further cycles not sampled after reset.
+warmup_cycles = 0
+# CSV with columns start_cycle,end_cycle (inclusive; cycle N begins at the N-th rising
+# clock edge after reset): sample only inside these windows, e.g. the kernel of a
+# program.
+# cycle_window_csv = "windows.csv"
+# A sampled cycle whose recorded state has a larger fraction of unknown (X/Z) digits is
+# replaced by another cycle.
+max_x_fraction = 0.02
+# Replacement cycles drawn per sampled cycle.
+reserve_factor = 3
+# Text the testbench prints when it passes.
+pass_string = "RESULT: PASS"
+# Regex rewrites of the testbench text for references to signals that synthesis renamed
+# or flattened: [{regex = '...', replacement = '...'}] (docs/SIMULATORS.md).
+tb_substitutions = []
+# Derive such rewrites for references into sub-modules (e.g. `dut.u_core.x`) from the
+# RTL in `rtl_files`.
+auto_derive_substitutions = false
+# RTL of the design, only for auto_derive_substitutions.
+rtl_files = []
+# Behavioural RTL for macros without a model (e.g. memories in library.blackbox_cells):
+# [{macro_module = '...', rtl_file = '...'}] (docs/SIMULATORS.md).
+macro_rtl_substitutions = []
+# Modules of the netlist to simulate from other sources: removed from the simulated copy
+# of the netlist.
+netlist_strip_modules = []
+# Sources that replace stripped modules.
+netlist_substitute_files = []
+# Compile timeout (seconds).
+compile_timeout_s = 600
+# Simulation timeout per run (seconds).
+sim_timeout_s = 600
+
+# --------------------------------------------------------------------------------------
+# The Verilog simulator that runs the testbench. Used by: record.
+[simulator]
+# Simulator: a preset, or `custom` with your own command templates (docs/SIMULATORS.md).
+# Keys below marked [x] apply to preset x only. One of: icarus | vcs | custom.
+preset = "icarus"
+# [all] Extra compile arguments, e.g. ["-full64"] for VCS.
+# extra_args = []
+# [all] Extra run-time arguments.
+# run_args = []
+# [all] Environment variables removed before the simulator runs, e.g.
+# ["LD_LIBRARY_PATH"].
+# env_unset = []
+# [icarus, custom] `timescale for sources that declare none (icarus default "1ns/1ps";
+# custom default: none).
+# timescale = "1ns/1ps"
+# [icarus] iverilog executable (default "iverilog").
+# iverilog = "iverilog"
+# [icarus] vvp executable (default "vvp").
+# vvp = "vvp"
+# [icarus] Language flag (default "-g2012").
+# generation = "-g2012"
+# [vcs] vcs executable (default "vcs").
+# vcs_binary = "vcs"
+# [vcs] Container image to run VCS in (default: none).
+# container = "vcs.sif"
+# [vcs] Container runtime (default "singularity").
+# container_runtime = "singularity"
+# [vcs] Arguments between the container runtime and the binds (default ["exec",
+# "--cleanenv"]).
+# container_exec_args = ["exec", "--cleanenv"]
+# [vcs, custom] Container bind specifications.
+# binds = []
+# [vcs] Bind the output directory (default true).
+# bind_output_dir = true
+# [custom] Compile command template.
+# compile = ["xrun", "-f", "{filelist}"]
+# [custom] Run command template.
+# run = ["{sim_bin}", "{plusargs}"]
+# [custom] Prefix of both commands, e.g. a container exec.
+# wrapper = []
+# [custom] Flag before each bind (default "-B").
+# bind_flag = "-B"
+# [custom] Form of one define (default "+define+{define}").
+# define_format = "+define+{define}"
+# [custom] Form of one include directory (default "+incdir+{dir}").
+# include_format = "+incdir+{dir}"
+# [custom] How the state is sampled: $fstrobe (any simulator) or an SV program block.
+# One of: strobe | program.
+# recorder = "strobe"
+
+# --------------------------------------------------------------------------------------
+# Which SETs are injected. Used by: inject.
+[fault_model]
+# SET pulse widths injected at every site (ps, > 0).
+pulse_widths_ps = [20, 40, 60, 80, 100, 120, 140, 160, 180]
+# Also inject on nets that drive flip-flop data pins. Used by: build.
+inject_ff_d_nets = true
+# Inject only on these nets, named as in the netlist with `/` between hierarchy levels
+# (default: every site).
+sites = []
+
+# --------------------------------------------------------------------------------------
+# Which flip-flops count as observation points. Used by: build.
+[observe]
+# Observe only flip-flops whose data pin has one of these names (default:
+# library.d_pins). Clock gates, whose "data" pin is an enable, are left out this way.
+data_pins = []
+# Regular expressions (whole cell name) of flip-flop cells not to observe, e.g.
+# clock-gating cells.
+exclude_cells = []
+# Flip-flop instances not to observe: substrings of their names.
+exclude_instances = []
+# Leave flip-flops without SDF setup/hold checks unobserved instead of failing. Used by:
+# build, inject.
+allow_missing_timing_checks = false
+
+# --------------------------------------------------------------------------------------
+# How a pulse propagates through the gates. Used by: inject.
+[propagation]
+# When several inputs of a gate change at the same instant and each explains the output
+# change, use the largest or smallest arc delay. One of: max | min.
+delay_choice = "max"
+# Inertial filtering: an output transition is cancelled when its cause reverts before
+# the gate delay has elapsed.
+electrical_masking = true
+# Added to the gate delay when deciding whether a pulse is filtered (ps); positive
+# filters more.
+em_margin_ps = 0
+# Which value of SDF (min:typ:max) triples to use: late = max, early = min. One of: late
+# | early. Used by: build.
+sdf_rail = "late"
+# SDF INTERCONNECT delays: ignore, or add them as pure delays. One of: ignore |
+# transport.
+interconnect = "ignore"
+# Simulate each SET for this many clock periods (>= 1).
+horizon_factor = 1.25
+
+# --------------------------------------------------------------------------------------
+# How the injection campaign runs. Used by: inject.
+[inject]
+# Parallel processes (does not change the results).
+jobs = 1
+# Cycles per record file; bounds memory (does not change the results).
+cycles_per_shard = 10
+# If > 0, also write inject/phase_grid_captures.csv: for start times k*T/steps (k =
+# 0..steps), the flip-flops that capture.
+phase_grid_steps = 0
+
+# --------------------------------------------------------------------------------------
+# How upset probabilities are computed. Used by: analyze.
+[analyze]
+# Pulse-width distributions; each is analysed into its own directory. A distribution
+# gives each injected width a probability: {type = "uniform"}, {type = "gaussian",
+# mean_ps = 90, sd_ps = 40}, {type = "exponential", tau_ps = 40}, or {type = "table",
+# weights = {"20" = 1.0, "40" = 0.5, ...}} naming every injected width. Weights are
+# normalised to sum to 1.
+width_models = [
+  { type = "uniform" },
+]
+# SET start times: [0, T), or [0, T] including the capture instant. One of: half_open |
+# closed.
+phase_domain = "half_open"
+# Also write the exposure of every trial (trial_exposure.npz).
+write_trials = false
+
+# --------------------------------------------------------------------------------------
+# Advanced options of the netlist and SDF reader. Used by: build.
+[build]
+# Verify a sample of fan-out cones by direct traversal.
+self_check = true
+# Number of cones verified.
+self_check_samples = 50
+# Seed of that sample.
+self_check_seed = 1
+# Fail when netlist and SDF instances differ.
+strict_sdf_crosscheck = true
+# Nets read by a cell but driven by nothing, tolerated.
+max_undriven_nets = 0
+# Keep intermediate files in build/intermediate/.
+keep_intermediates = false
+# Accept gate arcs without an SDF delay inside injection cones (pulses cannot pass them)
+# instead of failing.
+allow_missing_delays = false
