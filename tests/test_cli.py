@@ -34,6 +34,7 @@ OUTPUT_FILES = {  # a minimal complete output of each stage
     "record": {"cycles.json": {"format": "setfi-cycles/1", "cycles": [1]}, "states/cycle_1.hex": "0"},
     "inject": {"index.json": {"shards": [{"file": "records_c000_s000.npz"}]},
                "records_c000_s000.npz": ""},
+    "patterns": {"patterns.npz": "", "patterns.csv": ""},
 }
 
 
@@ -140,6 +141,29 @@ def test_deleted_stage_directories(tmp_path):
     assert _current(cfg, "build", require_output=False)[0]
     assert not _current(cfg, "build")[0]
     assert _current(cfg, "inject")[0]
+
+
+def test_the_patterns_stage_reads_its_steps_and_the_records(tmp_path, capsys):
+    cfg = _cfg(tmp_path)
+    for st in ("build", "record"):
+        _stamp(cfg, st)
+    _stamp(cfg, "inject", pulses="p1")
+    with pytest.raises(cli.SetfiCLIError, match=r"\[patterns\] steps is 0"):
+        cli.do_patterns(cfg)                                   # off by default
+    cli.do_status(cfg)
+    assert "patterns not computed ([patterns] steps = 0)" in capsys.readouterr().out
+    cfg["patterns"]["steps"] = 50
+    _stamp(cfg, "patterns")
+    assert _current(cfg, "patterns")[0]
+    cfg["patterns"]["jobs"] = 8                                # how it runs, not what it computes
+    assert _current(cfg, "patterns")[0]
+    cfg["patterns"]["steps"] = 20
+    ok, why = _current(cfg, "patterns")
+    assert not ok and "patterns.steps" in why
+    cfg["patterns"]["steps"] = 50
+    _stamp(cfg, "inject", pulses="p2")                         # other pulse records
+    ok, why = _current(cfg, "patterns")
+    assert not ok and "the result of inject" in why
 
 
 def test_analysis_names(tmp_path):

@@ -16,7 +16,7 @@ class Gate:
     var_nets: List[int]                       # input nets in truth-table bit order
     truth: List[int]
     arc_dkey: List[str]                       # per input: delay key ("" = no arc)
-    arc_cause_i: List[int]                    # per input: net whose revert cancels (EM)
+    arc_cause_i: List[int]                    # per input: the arc's input net (-1 = no arc)
     arc_side_nets: List[Optional[List[int]]]  # per input: side nets for COND lookup
     var_nets_src: List[int] = field(default_factory=list)  # driver nets before wire splicing
     inst: str = ""
@@ -61,23 +61,15 @@ class PackedCone:
 
 @dataclass
 class CapturePlan:
-    """Which recorded D nets feed which observed FFs, and their thresholds.
+    """Which recorded D nets feed which observed FFs.
 
     Local FF index li runs over the FFs this site can reach (sorted by ffid).
-    ``thr_enter[base, li]`` / ``thr_leave[base, li]`` are absolute times (ps
-    from the start of the cycle) bounding the FF's sampling window for a pulse
-    away from fault-free D value ``base``.
     """
     ffids: np.ndarray            # int32[n_ff] global ffid per local index
-    thr_enter: np.ndarray        # int64[2, n_ff]
-    thr_leave: np.ndarray        # int64[2, n_ff]
     dp_rec_slot: np.ndarray      # int32[n_dp] record slot of each D net
     dp_ptr: np.ndarray           # int32[n_dp+1] CSR: D net -> local FF indices
     dp_idx: np.ndarray           # int32[...]
     dp_dnet_names: List[str]
-    word_index: np.ndarray       # for capture_masks bit packing
-    word_mask: np.ndarray
-    n_words: int
 
     @property
     def n_ff(self) -> int:
@@ -377,7 +369,7 @@ def thresholds(sub: Substrate, ffid: int, capture_edge_ps: int) -> Tuple[int, in
     return enter0, leave0, enter1, leave1
 
 
-def build_capture_plan(sub: Substrate, cone: Cone, capture_edge_ps: int, stats: ConeStats) -> CapturePlan:
+def build_capture_plan(sub: Substrate, cone: Cone, stats: ConeStats) -> CapturePlan:
     reachable = sub.skeleton[cone.src_net]["reachable_dnets"]
     dn_to_ffids: Dict[str, List[int]] = {}
     ffid_set = set()
@@ -391,11 +383,6 @@ def build_capture_plan(sub: Substrate, cone: Cone, capture_edge_ps: int, stats: 
     ffids_local = sorted(ffid_set)
     n = len(ffids_local)
     li_of = {f: i for i, f in enumerate(ffids_local)}
-    thr_enter = np.zeros((2, n), dtype=np.int64)
-    thr_leave = np.zeros((2, n), dtype=np.int64)
-    for i, f in enumerate(ffids_local):
-        e0, l0, e1, l1 = thresholds(sub, f, capture_edge_ps)
-        thr_enter[0, i], thr_leave[0, i], thr_enter[1, i], thr_leave[1, i] = e0, l0, e1, l1
 
     dp_names: List[str] = []
     dp_slot: List[int] = []
@@ -413,10 +400,7 @@ def build_capture_plan(sub: Substrate, cone: Cone, capture_edge_ps: int, stats: 
             dp_slot.append(int(slot))
             idx.extend(li_of[f] for f in ffids)
             ptr.append(len(idx))
-    li = np.arange(n, dtype=np.int32)
-    return CapturePlan(ffids=np.asarray(ffids_local, dtype=np.int32), thr_enter=thr_enter,
-                       thr_leave=thr_leave, dp_rec_slot=np.asarray(dp_slot, dtype=np.int32),
+    return CapturePlan(ffids=np.asarray(ffids_local, dtype=np.int32),
+                       dp_rec_slot=np.asarray(dp_slot, dtype=np.int32),
                        dp_ptr=np.asarray(ptr, dtype=np.int32), dp_idx=np.asarray(idx, dtype=np.int32),
-                       dp_dnet_names=dp_names, word_index=(li >> 6).astype(np.int32),
-                       word_mask=(np.uint64(1) << (li.astype(np.uint64) & np.uint64(63))).astype(np.uint64),
-                       n_words=(n + 63) // 64)
+                       dp_dnet_names=dp_names)

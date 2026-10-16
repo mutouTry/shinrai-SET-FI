@@ -30,14 +30,25 @@ The pulse is simulated event by event through the fan-out cone of the site:
 
 * each gate whose input changes is re-evaluated from its truth table
   (logical masking);
-* an output transition takes the SDF `IOPATH` delay of the input that causes
-  it, for the rise or fall at the output, using `COND` entries selected by the
-  side inputs. If several inputs change at once, the largest of their delays
-  is used;
-* a scheduled transition is cancelled if its cause reverts before the delay
-  has elapsed (inertial filtering), so a pulse narrower than a gate's delay
-  dies at that gate;
-* each net holds at most one pending transition;
+* an output transition takes the SDF `IOPATH` delay of an input that changed,
+  for the rise or fall at the output. Where the SDF gives `COND` entries, it
+  is the delay of the entry that holds for the side-input values after the
+  change; if none holds (and the side-input values are known), the input's
+  path is inactive. The default delay of an arc is its unconditional SDF
+  value or, if there is none, the median of its conditional ones;
+* when several inputs change at the same instant, every changed input with an
+  active path competes and the smallest delay is used, as for module paths in
+  a Verilog simulator. If none of them has an active path, the inputs that
+  alone explain the output change (all changed inputs if none does) compete
+  with their default delays, and `propagation.delay_choice` picks the largest
+  (default) or the smallest. A single changed input gets the delay of its
+  `COND` entry that holds, or else its default delay;
+* each net holds at most one pending transition. If an input changes before
+  the transition happens and the re-evaluated gate gives the net's current
+  value again, the transition is cancelled (inertial filtering): a pulse
+  narrower than a gate's delay dies at that gate, while a pulse whose new
+  value another input still drives passes. A re-evaluation that gives the
+  pending value again keeps the transition at its scheduled time;
 * SDF `INTERCONNECT` delays can be added as pure transport delays.
 
 Every excursion of a flip-flop data pin from its fault-free value is recorded

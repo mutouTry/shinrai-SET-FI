@@ -1,4 +1,4 @@
-// setfi._engine — event-driven SET pulse propagation and D-pin capture.
+// setfi._engine: event-driven SET pulse propagation to the flip-flop D pins.
 //
 // Three entry points:
 //   simulate_pulses   inject one SET per pulse width on one source net and
@@ -6,33 +6,45 @@
 //                     event stream seen at every recorded FF D net.
 //   extract_pulses    turn a recorded event stream into pulse intervals
 //                     [t_enter, t_exit) relative to the SET start.
-//   capture_masks     for a grid of SET start times, which FFs capture a wrong
-//                     value (pulse overlaps the FF's setup/hold window).
+//   run_block         every (cycle, site, pulse width) trial of a block of
+//                     cycles: simulate_pulses and extract_pulses on compiled
+//                     cones, on several threads.
 //
 // The propagation model (see docs/MODEL.md):
 //   * logic: every gate is re-evaluated from its truth table on each input
 //     change (logical masking);
-//   * delay: the output transition takes the SDF IOPATH delay of the input
-//     that explains the change, conditional on side-input values where the SDF
-//     gives COND entries; when several inputs could explain it, the max (or
-//     min) delay is used;
-//   * electrical masking (inertial delay): a pending output transition is
-//     cancelled when its causing input reverts before t_cause + delay + margin;
-//   * one pending event per gate output; a new evaluation that returns the
-//     output to its current value cancels the pending one;
+//   * delay: an output transition takes the SDF IOPATH delay of an input that
+//     changed, for the rise or fall at the output, with the COND entry that
+//     holds for the side-input values after the change.  Every changed input
+//     whose path is active competes and the smallest delay is used (Verilog
+//     module-path delays).  A path is active unless its arc has COND entries,
+//     the side-input values are known and no COND entry for this output edge
+//     holds.  If no changed input has an active path, the changed inputs that
+//     alone explain the output change (all changed inputs if none does)
+//     compete with their default delays, and the max (or min) is used;
+//   * inertial delay: one pending transition per gate output; it is cancelled
+//     when the gate, re-evaluated on an input change before the transition
+//     fires, gives the current output value again, so a pulse narrower than
+//     the gate delay dies there;
 //   * optional transport wires (SDF INTERCONNECT) delay but never filter.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/stl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <queue>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "fastpath.hpp"
 
 namespace py = pybind11;
 
@@ -40,8 +52,6 @@ namespace {
 
 struct SimStats {
   int64_t applied_events = 0;
-  int64_t canceled_late = 0;
-  int64_t canceled_race = 0;
   int64_t canceled_replace = 0;
   int64_t canceled_back_to_current = 0;
   int64_t kept_same_target = 0;
@@ -56,7 +66,6 @@ using I32Arr = py::array_t<int32_t, py::array::c_style | py::array::forcecast>;
 using I64Arr = py::array_t<int64_t, py::array::c_style | py::array::forcecast>;
 using U8Arr = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>;
 using I8Arr = py::array_t<int8_t, py::array::c_style | py::array::forcecast>;
-using U64Arr = py::array_t<uint64_t, py::array::c_style | py::array::forcecast>;
 
 template <typename T>
 static py::array_t<T, py::array::c_style | py::array::forcecast>
@@ -88,6 +97,10 @@ static ArrView<T> view_1d(const py::array_t<T, py::array::c_style | py::array::f
 // Arc delay lookup.  Unconditional rise/fall delay per arc, optionally
 // overridden by the first matching conditional pattern (side-input values).
 // A pattern delay < 0 means "use the unconditional delay".
+// active_only: return -1 instead of the unconditional delay when the arc has
+// conditional patterns and none for this output edge matches: its path is
+// inactive (a Verilog state-dependent path whose condition is false).  An arc
+// without patterns, or whose side-input values are unknown, is always active.
 static inline int64_t delay_get_ps(const ArrView<int64_t>& default_rise_ps,
                                    const ArrView<int64_t>& default_fall_ps,
                                    const ArrView<int32_t>& patt_ptr,
@@ -96,7 +109,7 @@ static inline int64_t delay_get_ps(const ArrView<int64_t>& default_rise_ps,
                                    const ArrView<int64_t>& patt_dt_ps,
                                    const ArrView<uint8_t>& patt_is_rise,
                                    int32_t dkey_id, int tr_is_rise, bool sbits_valid,
-                                   int64_t sbits) {
+                                   int64_t sbits, bool active_only) {
   if (dkey_id < 0) return 0;
   tr_is_rise = tr_is_rise ? 1 : 0;
   if (dkey_id >= default_rise_ps.n || dkey_id >= default_fall_ps.n) return 0;
@@ -116,7 +129,7 @@ static inline int64_t delay_get_ps(const ArrView<int64_t>& default_rise_ps,
       return (dt < 0) ? def_ps : dt;
     }
   }
-  return def_ps;
+  return active_only ? -1 : def_ps;
 }
 
 struct Event {
@@ -137,8 +150,6 @@ struct EventCmp {
 static py::dict stats_dict(const SimStats& s) {
   py::dict d;
   d["applied_events"] = s.applied_events;
-  d["canceled_late"] = s.canceled_late;
-  d["canceled_race"] = s.canceled_race;
   d["canceled_replace"] = s.canceled_replace;
   d["canceled_back_to_current"] = s.canceled_back_to_current;
   d["kept_same_target"] = s.kept_same_target;
@@ -153,114 +164,87 @@ static py::dict stats_dict(const SimStats& s) {
 // ---------------------------------------------------------------------------
 // simulate_pulses
 // ---------------------------------------------------------------------------
-static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
-                                U8Arr net_val_init_u8, int32_t src_i, int32_t v0, int32_t v1,
-                                I64Arr pw_ps_array, int64_t sim_end_ps, int64_t eps_ps,
-                                bool enable_em, int64_t margin_ps, bool delay_policy_is_max) {
-  auto fanout_ptr_a = as_1d_array<int32_t>(packed_obj.attr("fanout_ptr"), "fanout_ptr");
-  auto fanout_idx_a = as_1d_array<int32_t>(packed_obj.attr("fanout_idx"), "fanout_idx");
-  auto gate_out_a = as_1d_array<int32_t>(packed_obj.attr("gate_out"), "gate_out");
-  auto gate_var_ptr_a = as_1d_array<int32_t>(packed_obj.attr("gate_var_ptr"), "gate_var_ptr");
-  auto gate_var_nets_a = as_1d_array<int32_t>(packed_obj.attr("gate_var_nets"), "gate_var_nets");
-  auto gate_truth_ptr_a = as_1d_array<int32_t>(packed_obj.attr("gate_truth_ptr"), "gate_truth_ptr");
-  auto gate_truth_a = as_1d_array<uint8_t>(packed_obj.attr("gate_truth"), "gate_truth");
-  auto arc_dkey_id_a = as_1d_array<int32_t>(packed_obj.attr("arc_dkey_id"), "arc_dkey_id");
-  auto arc_cause_i_a = as_1d_array<int32_t>(packed_obj.attr("arc_cause_i"), "arc_cause_i");
-  auto arc_side_mode_a = as_1d_array<int8_t>(packed_obj.attr("arc_side_mode"), "arc_side_mode");
-  auto arc_side_ptr_a = as_1d_array<int32_t>(packed_obj.attr("arc_side_ptr"), "arc_side_ptr");
-  auto arc_side_nets_a = as_1d_array<int32_t>(packed_obj.attr("arc_side_nets"), "arc_side_nets");
-  auto rec_idx_a = as_1d_array<int32_t>(packed_obj.attr("rec_idx"), "rec_idx");
-
-  auto default_rise_a = as_1d_array<int64_t>(delaytab_obj.attr("default_rise_ps"), "default_rise_ps");
-  auto default_fall_a = as_1d_array<int64_t>(delaytab_obj.attr("default_fall_ps"), "default_fall_ps");
-  auto patt_ptr_a = as_1d_array<int32_t>(delaytab_obj.attr("patt_ptr"), "patt_ptr");
-  auto patt_mask_a = as_1d_array<int64_t>(delaytab_obj.attr("patt_mask"), "patt_mask");
-  auto patt_valbits_a = as_1d_array<int64_t>(delaytab_obj.attr("patt_valbits"), "patt_valbits");
-  auto patt_dt_ps_a = as_1d_array<int64_t>(delaytab_obj.attr("patt_dt_ps"), "patt_dt_ps");
-  auto patt_is_rise_a = as_1d_array<uint8_t>(delaytab_obj.attr("patt_is_rise"), "patt_is_rise");
-
-  auto fanout_ptr = view_1d(fanout_ptr_a, "fanout_ptr");
-  auto fanout_idx = view_1d(fanout_idx_a, "fanout_idx");
-  auto gate_out = view_1d(gate_out_a, "gate_out");
-  auto gate_var_ptr = view_1d(gate_var_ptr_a, "gate_var_ptr");
-  auto gate_var_nets = view_1d(gate_var_nets_a, "gate_var_nets");
-  auto gate_truth_ptr = view_1d(gate_truth_ptr_a, "gate_truth_ptr");
-  auto gate_truth = view_1d(gate_truth_a, "gate_truth");
-  auto arc_dkey_id = view_1d(arc_dkey_id_a, "arc_dkey_id");
-  auto arc_cause_i = view_1d(arc_cause_i_a, "arc_cause_i");
-  auto arc_side_mode = view_1d(arc_side_mode_a, "arc_side_mode");
-  auto arc_side_ptr = view_1d(arc_side_ptr_a, "arc_side_ptr");
-  auto arc_side_nets = view_1d(arc_side_nets_a, "arc_side_nets");
-  auto rec_idx = view_1d(rec_idx_a, "rec_idx");
-
+// Read-only views of one packed cone (setfi.campaign.cone.PackedCone) and of the
+// delay table (setfi.campaign.substrate.DelayTable).
+struct ConeView {
+  ArrView<int32_t> fanout_ptr, fanout_idx, gate_out, gate_var_ptr, gate_var_nets, gate_truth_ptr;
+  ArrView<uint8_t> gate_truth;
+  ArrView<int32_t> arc_dkey_id, arc_cause_i;
+  ArrView<int8_t> arc_side_mode;
+  ArrView<int32_t> arc_side_ptr, arc_side_nets, rec_idx;
   // Optional transport wires (SDF INTERCONNECT), CSR over driver nets, sorted
   // zero-delay first: [wire_ptr[n], wire_zsplit[n]) have d == 0 and are
   // propagated inside the current time batch; [wire_zsplit[n], wire_ptr[n+1])
-  // have d > 0 and become one heap event per edge.
+  // have d > 0 and become one heap event per edge.  Read only when has_wires.
   ArrView<int32_t> wire_ptr, wire_zsplit, wire_sink;
   ArrView<int64_t> wire_rise_ps, wire_fall_ps;
-  I32Arr wp_keep, wz_keep, ws_keep;
-  I64Arr wr_keep, wf_keep;
   bool has_wires = false;
-  if (py::hasattr(packed_obj, "wire_sink")) {
-    wp_keep = as_1d_array<int32_t>(packed_obj.attr("wire_ptr"), "wire_ptr");
-    wz_keep = as_1d_array<int32_t>(packed_obj.attr("wire_zsplit"), "wire_zsplit");
-    ws_keep = as_1d_array<int32_t>(packed_obj.attr("wire_sink"), "wire_sink");
-    wr_keep = as_1d_array<int64_t>(packed_obj.attr("wire_rise_ps"), "wire_rise_ps");
-    wf_keep = as_1d_array<int64_t>(packed_obj.attr("wire_fall_ps"), "wire_fall_ps");
-    wire_ptr = view_1d(wp_keep, "wire_ptr");
-    wire_zsplit = view_1d(wz_keep, "wire_zsplit");
-    wire_sink = view_1d(ws_keep, "wire_sink");
-    wire_rise_ps = view_1d(wr_keep, "wire_rise_ps");
-    wire_fall_ps = view_1d(wf_keep, "wire_fall_ps");
-    if (wire_ptr.n != rec_idx.n + 1 || wire_zsplit.n != rec_idx.n)
-      throw std::runtime_error("wire_ptr/wire_zsplit length mismatch with n_nets");
-    if (wire_rise_ps.n != wire_sink.n || wire_fall_ps.n != wire_sink.n)
-      throw std::runtime_error("wire_sink/wire_rise_ps/wire_fall_ps length mismatch");
-    has_wires = (wire_sink.n > 0);
-  }
+};
 
-  auto default_rise = view_1d(default_rise_a, "default_rise_ps");
-  auto default_fall = view_1d(default_fall_a, "default_fall_ps");
-  auto patt_ptr = view_1d(patt_ptr_a, "patt_ptr");
-  auto patt_mask = view_1d(patt_mask_a, "patt_mask");
-  auto patt_valbits = view_1d(patt_valbits_a, "patt_valbits");
-  auto patt_dt_ps = view_1d(patt_dt_ps_a, "patt_dt_ps");
-  auto patt_is_rise = view_1d(patt_is_rise_a, "patt_is_rise");
+struct DelayView {
+  ArrView<int64_t> default_rise, default_fall;
+  ArrView<int32_t> patt_ptr;
+  ArrView<int64_t> patt_mask, patt_valbits, patt_dt_ps;
+  ArrView<uint8_t> patt_is_rise;
+};
+
+// per record slot: the (time, new value) of every transition applied to it
+using RecEvents = std::vector<std::vector<std::pair<int64_t, uint8_t>>>;
+
+// The propagation kernel of simulate_pulses, free of Python objects so that
+// run_block can call it without the GIL.  For every pulse width it fills
+// rec_events (one list per record slot) and then calls on_result(pw_idx, stats).
+// The propagation flags are the trailing arguments of simulate_pulses, in the
+// same order; run_block passes them from its EngineOptions.
+template <typename OnResult>
+static void simulate_pulses_core(const ConeView& cv, const DelayView& dv, const uint8_t* init_p,
+                                 int32_t src_i, int32_t v0, int32_t v1,
+                                 const int64_t* pw_ps_p, int64_t n_pw, int64_t sim_end_ps, int64_t eps_ps,
+                                 bool delay_policy_is_max, RecEvents& rec_events, OnResult&& on_result) {
+  const ArrView<int32_t>& fanout_ptr = cv.fanout_ptr;
+  const ArrView<int32_t>& fanout_idx = cv.fanout_idx;
+  const ArrView<int32_t>& gate_out = cv.gate_out;
+  const ArrView<int32_t>& gate_var_ptr = cv.gate_var_ptr;
+  const ArrView<int32_t>& gate_var_nets = cv.gate_var_nets;
+  const ArrView<int32_t>& gate_truth_ptr = cv.gate_truth_ptr;
+  const ArrView<uint8_t>& gate_truth = cv.gate_truth;
+  const ArrView<int32_t>& arc_dkey_id = cv.arc_dkey_id;
+  const ArrView<int32_t>& arc_cause_i = cv.arc_cause_i;
+  const ArrView<int8_t>& arc_side_mode = cv.arc_side_mode;
+  const ArrView<int32_t>& arc_side_ptr = cv.arc_side_ptr;
+  const ArrView<int32_t>& arc_side_nets = cv.arc_side_nets;
+  const ArrView<int32_t>& rec_idx = cv.rec_idx;
+  const ArrView<int32_t>& wire_ptr = cv.wire_ptr;
+  const ArrView<int32_t>& wire_zsplit = cv.wire_zsplit;
+  const ArrView<int32_t>& wire_sink = cv.wire_sink;
+  const ArrView<int64_t>& wire_rise_ps = cv.wire_rise_ps;
+  const ArrView<int64_t>& wire_fall_ps = cv.wire_fall_ps;
+  const bool has_wires = cv.has_wires;
+  const ArrView<int64_t>& default_rise = dv.default_rise;
+  const ArrView<int64_t>& default_fall = dv.default_fall;
+  const ArrView<int32_t>& patt_ptr = dv.patt_ptr;
+  const ArrView<int64_t>& patt_mask = dv.patt_mask;
+  const ArrView<int64_t>& patt_valbits = dv.patt_valbits;
+  const ArrView<int64_t>& patt_dt_ps = dv.patt_dt_ps;
+  const ArrView<uint8_t>& patt_is_rise = dv.patt_is_rise;
 
   const int32_t n_nets = (int32_t)rec_idx.n;
   const int32_t n_gates = (int32_t)gate_out.n;
-
-  auto init_info = net_val_init_u8.request();
-  if (init_info.ndim != 1) throw std::runtime_error("net_val_init_u8 must be 1-D");
-  if ((int64_t)init_info.shape[0] != n_nets)
-    throw std::runtime_error("net_val_init_u8 length does not match the cone's net count");
-  const uint8_t* init_p = static_cast<const uint8_t*>(init_info.ptr);
 
   int32_t n_rec_slots = 0;
   for (int32_t i = 0; i < n_nets; i++) {
     const int32_t r = rec_idx.p[i];
     if (r >= 0) n_rec_slots = std::max(n_rec_slots, (int32_t)(r + 1));
   }
-
-  auto pw_info = pw_ps_array.request();
-  if (pw_info.ndim != 1) throw std::runtime_error("pw_ps_array must be 1-D");
-  const int64_t n_pw = (int64_t)pw_info.shape[0];
-  const int64_t* pw_ps_p = static_cast<const int64_t*>(pw_info.ptr);
-
-  py::list result;
-  std::vector<std::vector<std::pair<int64_t, uint8_t>>> rec_events((size_t)n_rec_slots);
+  rec_events.resize((size_t)n_rec_slots);
 
   for (int64_t pw_idx = 0; pw_idx < n_pw; ++pw_idx) {
     const int64_t pw_ps = pw_ps_p[pw_idx];
     SimStats stats;
 
     if (src_i < 0) {
-      I32Arr ev_ptr({(py::ssize_t)(n_rec_slots + 1)});
-      std::fill(ev_ptr.mutable_data(), ev_ptr.mutable_data() + (n_rec_slots + 1), 0);
-      I64Arr ev_t({(py::ssize_t)0});
-      U8Arr ev_v({(py::ssize_t)0});
-      result.append(py::make_tuple(ev_ptr, ev_t, ev_v, stats_dict(stats)));
+      for (auto& lst : rec_events) lst.clear();
+      on_result(pw_idx, stats);
       continue;
     }
 
@@ -281,8 +265,6 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
     std::vector<uint8_t> canceled(2, 0);
     std::vector<int32_t> tok2outnet(2, -1);
     std::vector<uint8_t> tok2pend_val(2, 0);
-    std::vector<int32_t> tok2cause(2, -1);
-    std::vector<int64_t> tok2deadline(2, std::numeric_limits<int64_t>::min());
 
     auto ensure_tok = [&](int32_t tok) {
       if (tok >= (int32_t)canceled.size()) {
@@ -290,13 +272,9 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
         canceled.resize(new_sz, 0);
         tok2outnet.resize(new_sz, -1);
         tok2pend_val.resize(new_sz, 0);
-        tok2cause.resize(new_sz, -1);
-        tok2deadline.resize(new_sz, std::numeric_limits<int64_t>::min());
       }
     };
 
-    std::vector<std::vector<std::pair<int64_t, int32_t>>> pending_by_cause;
-    if (enable_em) pending_by_cause.resize((size_t)n_nets);
     std::vector<int32_t> pending_tok_by_outnet((size_t)n_nets, -1);
 
     std::priority_queue<Event, std::vector<Event>, EventCmp> heap;
@@ -320,7 +298,8 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
       return tok;
     };
 
-    enum CancelWhy { WHY_LATE, WHY_RACE, WHY_REPLACE, WHY_BACK };
+    // cancel a pending transition: its event is skipped when it comes off the heap
+    enum CancelWhy { WHY_REPLACE, WHY_BACK };
     auto cancel_token = [&](int32_t tok, CancelWhy why) {
       if (tok <= 0) return;
       ensure_tok(tok);
@@ -332,23 +311,8 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
         tok2outnet[(size_t)tok] = -1;
       }
       tok2pend_val[(size_t)tok] = 0;
-      tok2cause[(size_t)tok] = -1;
-      tok2deadline[(size_t)tok] = std::numeric_limits<int64_t>::min();
-      if (why == WHY_LATE) stats.canceled_late++;
-      else if (why == WHY_RACE) stats.canceled_race++;
-      else if (why == WHY_REPLACE) stats.canceled_replace++;
-    };
-
-    // electrical masking: the cause net reverted before the deadline
-    auto cancel_pending_due_to_input_revert = [&](int32_t cause_i, int64_t t_now_ps) {
-      if (!enable_em) return;
-      if (cause_i < 0 || cause_i >= n_nets) return;
-      auto& lst = pending_by_cause[(size_t)cause_i];
-      if (lst.empty()) return;
-      for (auto& pr : lst) {
-        if (t_now_ps < pr.first) cancel_token(pr.second, WHY_LATE);
-      }
-      lst.clear();
+      if (why == WHY_REPLACE) stats.canceled_replace++;
+      else stats.canceled_back_to_current++;
     };
 
     // the SET: flip the source net at t=0, restore it at t=pw
@@ -361,7 +325,7 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
     touched.reserve(1024);
 
     // A wire delays a pulse and never masks one: these helpers never touch the
-    // pending/cause bookkeeping, so a wire cannot cancel anything.
+    // pending-transition bookkeeping, so a wire cannot cancel anything.
     auto propagate_zero_wires = [&]() {
       if (!has_wires) return;
       const size_t n0 = touched.size();
@@ -391,9 +355,6 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
         }
       }
     };
-
-    std::vector<int32_t> will_mark((size_t)n_nets, 0);
-    int32_t will_tag = 1;
 
     while (!heap.empty()) {
       const Event e0 = heap.top();
@@ -447,56 +408,6 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
       propagate_zero_wires();
       if (touched.empty()) continue;
 
-      will_tag++;
-      if (will_tag >= 1'000'000'000) {
-        std::fill(will_mark.begin(), will_mark.end(), 0);
-        will_tag = 1;
-      }
-      bool any_will = false;
-      for (int32_t ni : touched) {
-        const uint8_t vv = best_val[(size_t)ni] & 1;
-        if (vv != (net_val[(size_t)ni] & 1)) {
-          will_mark[(size_t)ni] = will_tag;
-          any_will = true;
-        }
-      }
-
-      // same-timestamp race: an output event whose cause changes in this very
-      // batch, before its deadline, is electrically masked
-      if (enable_em && any_will) {
-        bool any_canceled = false;
-        for (int32_t ni : touched) {
-          const int32_t tok = best_tok[(size_t)ni];
-          if (tok <= 0) continue;
-          ensure_tok(tok);
-          const int32_t cause_i = tok2cause[(size_t)tok];
-          if (cause_i < 0 || cause_i >= n_nets) continue;
-          if (will_mark[(size_t)cause_i] != will_tag) continue;
-          if (t0_ps < tok2deadline[(size_t)tok]) {
-            cancel_token(tok, WHY_RACE);
-            any_canceled = true;
-          }
-        }
-        if (any_canceled) {
-          for (int32_t ni : touched) best_tok[(size_t)ni] = -1;
-          touched.clear();
-          for (const auto& ev : batch) {
-            const int32_t tok = ev.tok;
-            ensure_tok(tok);
-            if (canceled[(size_t)tok]) continue;
-            const int32_t ni = ev.net_i;
-            const int32_t bt = best_tok[(size_t)ni];
-            if (bt < tok) {
-              if (bt < 0) touched.push_back(ni);
-              best_tok[(size_t)ni] = tok;
-              best_val[(size_t)ni] = (uint8_t)(ev.val & 1);
-            }
-          }
-          propagate_zero_wires();
-          if (touched.empty()) continue;
-        }
-      }
-
       tag++;
       if (tag >= 1'000'000'000) {
         std::fill(old_tag.begin(), old_tag.end(), 0);
@@ -531,9 +442,6 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
       }
       if (changed_nets.empty()) continue;
 
-      if (enable_em) {
-        for (int32_t cn : changed_nets) cancel_pending_due_to_input_revert(cn, t0_ps);
-      }
       propagate_delayed_wires(changed_nets, t0_ps);
 
       gate_mark_tag++;
@@ -577,56 +485,28 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
         const int32_t tb = gate_truth_ptr.p[gid + 1];
         const uint8_t y_new = (tb - ta <= 1) ? (gate_truth.p[ta] & 1) : (gate_truth.p[ta + idx_cur] & 1);
 
+        // Inertial delay: the gate gives its current value again before the
+        // pending transition fires, so the pending transition is cancelled.
         if (y_new == y_cur) {
           const int32_t old_tok = pending_tok_by_outnet[(size_t)out_i];
           if (old_tok > 0) {
             ensure_tok(old_tok);
-            if (!canceled[(size_t)old_tok] && tok2pend_val[(size_t)old_tok] != y_cur) {
-              stats.canceled_back_to_current++;
+            if (!canceled[(size_t)old_tok] && tok2pend_val[(size_t)old_tok] != y_cur)
               cancel_token(old_tok, WHY_BACK);
-            }
           }
           continue;
         }
 
         const int tr_is_rise = (y_cur == 0 && y_new == 1) ? 1 : 0;
 
-        // candidate inputs: changed inputs that alone explain the output change
-        std::vector<int32_t> cands;
-        cands.reserve(8);
-        {
-          int32_t m = changed_mask;
-          int32_t ppos = 0;
-          while (m) {
-            if (m & 1) {
-              const int32_t idx_ovr = (idx_prev & ~(1 << ppos)) | (idx_cur & (1 << ppos));
-              const uint8_t yy = (tb - ta <= 1) ? (gate_truth.p[ta] & 1) : (gate_truth.p[ta + idx_ovr] & 1);
-              if (yy != y_cur) cands.push_back(ppos);
-            }
-            m >>= 1;
-            ppos++;
-          }
-        }
-        if (cands.empty()) {
-          for (int32_t j = 0; j < k_in; j++)
-            if ((changed_mask >> j) & 1) cands.push_back(j);
-        }
-        if (cands.empty()) continue;
-
-        bool found = false;
-        int64_t best_delay = 0;
-        int32_t best_cause = -1;
-
-        auto try_candidate = [&](int32_t ppos, int64_t& d_used, int32_t& cause_out, bool& ok) {
+        // Delay of the arc from input ppos for this output transition, its COND
+        // patterns evaluated on the side inputs' current (post-change) values; with
+        // active_only, -1 marks an inactive path.  false: the input has no delay
+        // arc and cannot carry the transition.
+        auto arc_delay = [&](int32_t ppos, bool active_only, int64_t& d_used) -> bool {
           const int32_t idx = va + ppos;
           const int32_t dkey_id = arc_dkey_id.p[idx];
-          const int32_t cause_i = arc_cause_i.p[idx];
-          // No delay arc for this input: it cannot carry the transition.
-          if (dkey_id < 0 || cause_i < 0) {
-            stats.dropped_arc_no_delay++;
-            ok = false;
-            return;
-          }
+          if (dkey_id < 0 || arc_cause_i.p[idx] < 0) return false;
           const int8_t mode = arc_side_mode.p[idx];
           bool sbits_valid = true;
           int64_t sbits = 0;
@@ -651,38 +531,58 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
             else sbits = sbv;
           }
           d_used = delay_get_ps(default_rise, default_fall, patt_ptr, patt_mask, patt_valbits,
-                                patt_dt_ps, patt_is_rise, dkey_id, tr_is_rise, sbits_valid, sbits);
-          cause_out = cause_i;
-          ok = true;
+                                patt_dt_ps, patt_is_rise, dkey_id, tr_is_rise, sbits_valid, sbits,
+                                active_only);
+          return true;
         };
 
-        if (delay_policy_is_max) {
-          int64_t best_d = -1;
-          for (int32_t pp : cands) {
-            int64_t d_used = 0;
-            int32_t cause_i = -1;
-            bool ok = false;
-            try_candidate(pp, d_used, cause_i, ok);
-            if (!ok) continue;
-            if (d_used > best_d) {
-              best_d = d_used;
-              best_delay = d_used;
-              best_cause = cause_i;
-              found = true;
+        // Verilog module-path delays: every changed input whose path is active
+        // competes, and the smallest delay is used.
+        bool found = false;
+        int64_t best_delay = 0;
+        for (int32_t j = 0; j < k_in; j++) {
+          if (!((changed_mask >> j) & 1)) continue;
+          int64_t d_used = 0;
+          if (!arc_delay(j, true, d_used) || d_used < 0) continue;   // no arc, or inactive
+          if (!found || d_used < best_delay) {
+            found = true;
+            best_delay = d_used;
+          }
+        }
+
+        // No changed input has an active path: the changed inputs that alone
+        // explain the output change (all changed inputs if none does) compete
+        // with their default delays, and delay_choice picks the max or the min.
+        if (!found) {
+          std::vector<int32_t> cands;
+          cands.reserve(8);
+          {
+            int32_t m = changed_mask;
+            int32_t ppos = 0;
+            while (m) {
+              if (m & 1) {
+                const int32_t idx_ovr = (idx_prev & ~(1 << ppos)) | (idx_cur & (1 << ppos));
+                const uint8_t yy = (tb - ta <= 1) ? (gate_truth.p[ta] & 1) : (gate_truth.p[ta + idx_ovr] & 1);
+                if (yy != y_cur) cands.push_back(ppos);
+              }
+              m >>= 1;
+              ppos++;
             }
           }
-        } else {
-          int64_t best_d = (std::numeric_limits<int64_t>::max)();
+          if (cands.empty()) {
+            for (int32_t j = 0; j < k_in; j++)
+              if ((changed_mask >> j) & 1) cands.push_back(j);
+          }
+          int64_t best_d = delay_policy_is_max ? -1 : (std::numeric_limits<int64_t>::max)();
           for (int32_t pp : cands) {
             int64_t d_used = 0;
-            int32_t cause_i = -1;
-            bool ok = false;
-            try_candidate(pp, d_used, cause_i, ok);
-            if (!ok) continue;
-            if (d_used < best_d) {
+            if (!arc_delay(pp, false, d_used)) {
+              stats.dropped_arc_no_delay++;
+              continue;
+            }
+            if (delay_policy_is_max ? (d_used > best_d) : (d_used < best_d)) {
               best_d = d_used;
               best_delay = d_used;
-              best_cause = cause_i;
               found = true;
             }
           }
@@ -710,19 +610,113 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
         ensure_tok(tok_new);
         tok2outnet[(size_t)tok_new] = out_i;
         tok2pend_val[(size_t)tok_new] = (uint8_t)(y_new & 1);
-
-        if (enable_em) {
-          const int64_t deadline = t0_ps + best_delay + margin_ps;
-          if (best_cause >= 0 && best_cause < n_nets) {
-            pending_by_cause[(size_t)best_cause].push_back({deadline, tok_new});
-            tok2cause[(size_t)tok_new] = best_cause;
-            tok2deadline[(size_t)tok_new] = deadline;
-          }
-        }
       }
     }
 
+    on_result(pw_idx, stats);
+  }
+}
+
+static ConeView cone_view_of_packed(const py::object& packed_obj, std::vector<py::object>& keep) {
+  ConeView cv;
+  auto i32 = [&](const char* name, ArrView<int32_t>& v) {
+    I32Arr a = as_1d_array<int32_t>(packed_obj.attr(name), name);
+    v = view_1d(a, name);
+    keep.push_back(a);
+  };
+  i32("fanout_ptr", cv.fanout_ptr);
+  i32("fanout_idx", cv.fanout_idx);
+  i32("gate_out", cv.gate_out);
+  i32("gate_var_ptr", cv.gate_var_ptr);
+  i32("gate_var_nets", cv.gate_var_nets);
+  i32("gate_truth_ptr", cv.gate_truth_ptr);
+  {
+    U8Arr a = as_1d_array<uint8_t>(packed_obj.attr("gate_truth"), "gate_truth");
+    cv.gate_truth = view_1d(a, "gate_truth");
+    keep.push_back(a);
+  }
+  i32("arc_dkey_id", cv.arc_dkey_id);
+  i32("arc_cause_i", cv.arc_cause_i);
+  {
+    I8Arr a = as_1d_array<int8_t>(packed_obj.attr("arc_side_mode"), "arc_side_mode");
+    cv.arc_side_mode = view_1d(a, "arc_side_mode");
+    keep.push_back(a);
+  }
+  i32("arc_side_ptr", cv.arc_side_ptr);
+  i32("arc_side_nets", cv.arc_side_nets);
+  i32("rec_idx", cv.rec_idx);
+  if (py::hasattr(packed_obj, "wire_sink")) {
+    i32("wire_ptr", cv.wire_ptr);
+    i32("wire_zsplit", cv.wire_zsplit);
+    i32("wire_sink", cv.wire_sink);
+    I64Arr r = as_1d_array<int64_t>(packed_obj.attr("wire_rise_ps"), "wire_rise_ps");
+    I64Arr f = as_1d_array<int64_t>(packed_obj.attr("wire_fall_ps"), "wire_fall_ps");
+    cv.wire_rise_ps = view_1d(r, "wire_rise_ps");
+    cv.wire_fall_ps = view_1d(f, "wire_fall_ps");
+    keep.push_back(r);
+    keep.push_back(f);
+    if (cv.wire_ptr.n != cv.rec_idx.n + 1 || cv.wire_zsplit.n != cv.rec_idx.n)
+      throw std::runtime_error("wire_ptr/wire_zsplit length mismatch with n_nets");
+    if (cv.wire_rise_ps.n != cv.wire_sink.n || cv.wire_fall_ps.n != cv.wire_sink.n)
+      throw std::runtime_error("wire_sink/wire_rise_ps/wire_fall_ps length mismatch");
+    cv.has_wires = (cv.wire_sink.n > 0);
+  }
+  return cv;
+}
+
+static DelayView delay_view_of(const py::object& delaytab_obj, std::vector<py::object>& keep) {
+  DelayView dv;
+  auto i64 = [&](const char* name, ArrView<int64_t>& v) {
+    I64Arr a = as_1d_array<int64_t>(delaytab_obj.attr(name), name);
+    v = view_1d(a, name);
+    keep.push_back(a);
+  };
+  i64("default_rise_ps", dv.default_rise);
+  i64("default_fall_ps", dv.default_fall);
+  {
+    I32Arr a = as_1d_array<int32_t>(delaytab_obj.attr("patt_ptr"), "patt_ptr");
+    dv.patt_ptr = view_1d(a, "patt_ptr");
+    keep.push_back(a);
+  }
+  i64("patt_mask", dv.patt_mask);
+  i64("patt_valbits", dv.patt_valbits);
+  i64("patt_dt_ps", dv.patt_dt_ps);
+  {
+    U8Arr a = as_1d_array<uint8_t>(delaytab_obj.attr("patt_is_rise"), "patt_is_rise");
+    dv.patt_is_rise = view_1d(a, "patt_is_rise");
+    keep.push_back(a);
+  }
+  return dv;
+}
+
+// Python entry point for one site and one bound state: one (ev_ptr, ev_t, ev_v,
+// stats) tuple per pulse width.
+static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
+                                U8Arr net_val_init_u8, int32_t src_i, int32_t v0, int32_t v1,
+                                I64Arr pw_ps_array, int64_t sim_end_ps, int64_t eps_ps,
+                                bool delay_policy_is_max) {
+  std::vector<py::object> keep;
+  const ConeView cv = cone_view_of_packed(packed_obj, keep);
+  const DelayView dv = delay_view_of(delaytab_obj, keep);
+  const int32_t n_nets = (int32_t)cv.rec_idx.n;
+
+  auto init_info = net_val_init_u8.request();
+  if (init_info.ndim != 1) throw std::runtime_error("net_val_init_u8 must be 1-D");
+  if ((int64_t)init_info.shape[0] != n_nets)
+    throw std::runtime_error("net_val_init_u8 length does not match the cone's net count");
+  const uint8_t* init_p = static_cast<const uint8_t*>(init_info.ptr);
+
+  auto pw_info = pw_ps_array.request();
+  if (pw_info.ndim != 1) throw std::runtime_error("pw_ps_array must be 1-D");
+  const int64_t n_pw = (int64_t)pw_info.shape[0];
+  const int64_t* pw_ps_p = static_cast<const int64_t*>(pw_info.ptr);
+
+  py::list result;
+  RecEvents rec_events;
+  simulate_pulses_core(cv, dv, init_p, src_i, v0, v1, pw_ps_p, n_pw, sim_end_ps, eps_ps,
+                       delay_policy_is_max, rec_events, [&](int64_t, const SimStats& stats) {
     // flatten the recorded events (CSR over record slots)
+    const int32_t n_rec_slots = (int32_t)rec_events.size();
     I32Arr ev_ptr({(py::ssize_t)(n_rec_slots + 1)});
     int32_t* ptrp = ev_ptr.mutable_data();
     ptrp[0] = 0;
@@ -744,7 +738,7 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
       }
     }
     result.append(py::make_tuple(ev_ptr, ev_t, ev_v, stats_dict(stats)));
-  }
+  });
   return result;
 }
 
@@ -777,6 +771,22 @@ static inline void for_each_pulse(const int64_t* et, const uint8_t* ev, int32_t 
   if (in_pulse) emit(t_enter, inf_ps);
 }
 
+// emit(dpi, t_enter, t_exit) for every pulse at every recorded D net dpi, in
+// D-net order (shared by extract_pulses and run_block)
+template <typename Emit>
+static inline void for_each_dp_pulse(const int32_t* eptr, int32_t n_rec_ptr, const int64_t* et,
+                                     const uint8_t* ev, const int32_t* slot, const uint8_t* basep,
+                                     int32_t n_dp, int64_t inf_ps, Emit&& emit) {
+  for (int32_t dpi = 0; dpi < n_dp; ++dpi) {
+    const int32_t rs = slot[dpi];
+    if (rs < 0 || rs + 1 >= n_rec_ptr) continue;
+    const int32_t a = eptr[rs], b = eptr[rs + 1];
+    if (a >= b) continue;
+    for_each_pulse(et, ev, a, b, basep[dpi] & 1, inf_ps,
+                   [&](int64_t ta, int64_t tb) { emit(dpi, ta, tb); });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // extract_pulses: pulse intervals at every recorded D net
 // ---------------------------------------------------------------------------
@@ -796,17 +806,12 @@ static py::tuple extract_pulses(I32Arr ev_ptr, I64Arr ev_t, U8Arr ev_v, I32Arr d
 
   std::vector<int32_t> o_dp;
   std::vector<int64_t> o_a, o_b;
-  for (int32_t dpi = 0; dpi < n_dp; ++dpi) {
-    const int32_t rs = slot[dpi];
-    if (rs < 0 || rs + 1 >= n_rec_ptr) continue;
-    const int32_t a = eptr[rs], b = eptr[rs + 1];
-    if (a >= b) continue;
-    for_each_pulse(et, ev, a, b, basep[dpi] & 1, inf_ps, [&](int64_t ta, int64_t tb) {
-      o_dp.push_back(dpi);
-      o_a.push_back(ta);
-      o_b.push_back(tb);
-    });
-  }
+  for_each_dp_pulse(eptr, n_rec_ptr, et, ev, slot, basep, n_dp, inf_ps,
+                    [&](int32_t dpi, int64_t ta, int64_t tb) {
+    o_dp.push_back(dpi);
+    o_a.push_back(ta);
+    o_b.push_back(tb);
+  });
   const py::ssize_t n = (py::ssize_t)o_dp.size();
   I32Arr r_dp({n});
   I64Arr r_a({n}), r_b({n});
@@ -816,142 +821,366 @@ static py::tuple extract_pulses(I32Arr ev_ptr, I64Arr ev_t, U8Arr ev_v, I32Arr d
   return py::make_tuple(r_dp, r_a, r_b);
 }
 
-static inline int32_t lower_bound_i64(const int64_t* a, int32_t n, int64_t v) {
-  int32_t l = 0, r = n;
-  while (l < r) {
-    const int32_t m = l + ((r - l) >> 1);
-    if (a[m] < v) l = m + 1;
-    else r = m;
-  }
-  return l;
-}
-
-static inline int32_t upper_bound_i64(const int64_t* a, int32_t n, int64_t v) {
-  int32_t l = 0, r = n;
-  while (l < r) {
-    const int32_t m = l + ((r - l) >> 1);
-    if (a[m] <= v) l = m + 1;
-    else r = m;
-  }
-  return l;
-}
-
-static inline void require(bool cond, const char* msg) {
-  if (!cond) throw std::runtime_error(msg);
-}
-
 // ---------------------------------------------------------------------------
-// capture_masks: per SET start time, the bit set of FFs that capture
+// run_block: every (cycle, site, pulse width) trial of a block of cycles
 // ---------------------------------------------------------------------------
-// A pulse [a, b) at the D pin (relative to the SET start s) is captured by an
-// FF with sampling thresholds (thr_enter, thr_leave) iff
-//     thr_leave - b + 1 <= s <= thr_enter - a - 1.
-static py::array_t<uint64_t> capture_masks(I64Arr starts_ps, I64Arr thr_enter_local,
-                                           I64Arr thr_leave_local, I32Arr ev_ptr, I64Arr ev_t,
-                                           U8Arr ev_v, I32Arr dp_rec_slot, U8Arr dp_base_u8,
-                                           I32Arr dp_localpos_ptr, I32Arr dp_localpos_idx,
-                                           I32Arr word_index, U64Arr word_mask, int n_words,
-                                           int64_t inf_ps) {
-  require(starts_ps.ndim() == 1, "starts_ps must be 1-D");
-  require(thr_enter_local.ndim() == 2 && thr_leave_local.ndim() == 2, "thr_*_local must be [2, n_ff]");
-  require(ev_ptr.ndim() == 1 && ev_t.ndim() == 1 && ev_v.ndim() == 1, "ev_ptr/ev_t/ev_v must be 1-D");
-  require(dp_rec_slot.ndim() == 1 && dp_base_u8.ndim() == 1, "dp_rec_slot/dp_base_u8 must be 1-D");
-  require(dp_localpos_ptr.ndim() == 1 && dp_localpos_idx.ndim() == 1, "dp_localpos_ptr/idx must be 1-D");
-  require(word_index.ndim() == 1 && word_mask.ndim() == 1, "word_index/word_mask must be 1-D");
+// The trial loop of setfi.campaign.run, in C++: for each site and cycle, bind
+// the recorded state to the compiled cone, run simulate_pulses_core for all
+// pulse widths and turn the D-pin events into records (as extract_pulses).
+// Sites are shared out over n_threads threads, the calling thread among them;
+// the result does not depend on the thread count.  A Python signal handler that
+// raises (Ctrl-C) stops the block within about 50 ms plus one site's trials.
 
-  const int32_t n_st = (int32_t)starts_ps.shape(0);
-  const int32_t n_rff = (int32_t)word_index.shape(0);
-  require(word_mask.shape(0) == n_rff, "word_index and word_mask size mismatch");
-  require(thr_enter_local.shape(0) == 2 && thr_leave_local.shape(0) == 2, "thr_*_local first dim must be 2");
-  require(thr_enter_local.shape(1) == n_rff && thr_leave_local.shape(1) == n_rff,
-          "thr_*_local second dim must match n_ff");
-  const int32_t n_dp = (int32_t)dp_rec_slot.shape(0);
-  require((int32_t)dp_base_u8.shape(0) == n_dp, "dp_base_u8 length must match n_dp");
-  require((int32_t)dp_localpos_ptr.shape(0) == n_dp + 1, "dp_localpos_ptr must have length n_dp+1");
-  require(n_words > 0, "n_words must be > 0");
-  require(ev_t.shape(0) == ev_v.shape(0), "ev_t and ev_v must have the same length");
+// The propagation options of a campaign: the keys of run_block's `options`
+// (setfi.campaign.run.engine_options), i.e. the trailing arguments of
+// simulate_pulses.  Unknown or missing keys are an error.
+struct EngineOptions {
+  int64_t sim_end_ps = 0;
+  int64_t eps_ps = 0;
+  bool delay_policy_is_max = true;
+};
 
-  py::array_t<uint64_t> out({(py::ssize_t)n_st, (py::ssize_t)n_words});
-  uint64_t* outp = (uint64_t*)out.mutable_data();
-  std::fill(outp, outp + (size_t)n_st * (size_t)n_words, 0ULL);
-  if (n_st == 0 || n_rff == 0 || n_dp == 0) return out;
+static EngineOptions engine_options_from(const py::dict& d) {
+  static const char* const keys[] = {"sim_end_ps", "eps_ps", "delay_policy_is_max"};
+  for (auto kv : d) {
+    const std::string k = py::cast<std::string>(kv.first);
+    if (std::find_if(std::begin(keys), std::end(keys), [&](const char* x) { return k == x; }) == std::end(keys))
+      throw std::runtime_error("run_block: unknown engine option '" + k + "'");
+  }
+  auto need = [&](const char* k) -> py::object {
+    if (!d.contains(k)) throw std::runtime_error(std::string("run_block: engine option '") + k + "' is missing");
+    return d[k];
+  };
+  EngineOptions o;
+  o.sim_end_ps = py::cast<int64_t>(need("sim_end_ps"));
+  o.eps_ps = py::cast<int64_t>(need("eps_ps"));
+  o.delay_policy_is_max = py::cast<bool>(need("delay_policy_is_max"));
+  return o;
+}
 
-  const int64_t* starts = starts_ps.data();
-  const int64_t starts0 = starts[0];
-  const int64_t startsN = starts[n_st - 1];
-  const int64_t* thr_enter = thr_enter_local.data();
-  const int64_t* thr_leave = thr_leave_local.data();
-  const int32_t* eptr = ev_ptr.data();
-  const int64_t* et = ev_t.data();
-  const uint8_t* ev = ev_v.data();
-  const int32_t* dp_slot = dp_rec_slot.data();
-  const uint8_t* dp_base = dp_base_u8.data();
-  const int32_t* lp_ptr = dp_localpos_ptr.data();
-  const int32_t* lp_idx = dp_localpos_idx.data();
-  const int32_t* widx = word_index.data();
-  const uint64_t* wmsk = word_mask.data();
+template <typename T>
+static ArrView<T> view_vec(const std::vector<T>& v) {
+  ArrView<T> a;
+  a.p = v.data();
+  a.n = (int64_t)v.size();
+  return a;
+}
 
-  const size_t row_len = (size_t)n_st + 1u;
-  static thread_local std::vector<int64_t> diffs;
-  diffs.assign((size_t)n_rff * row_len, 0);
+static ConeView cone_view_of(const setfi_fast::CompiledCone& c) {
+  ConeView cv;
+  cv.fanout_ptr = view_vec(c.fanout_ptr);
+  cv.fanout_idx = view_vec(c.fanout_idx);
+  cv.gate_out = view_vec(c.gate_out);
+  cv.gate_var_ptr = view_vec(c.gate_var_ptr);
+  cv.gate_var_nets = view_vec(c.gate_var_nets);
+  cv.gate_truth_ptr = view_vec(c.gate_truth_ptr);
+  cv.gate_truth = view_vec(c.gate_truth);
+  cv.arc_dkey_id = view_vec(c.arc_dkey_id);
+  cv.arc_cause_i = view_vec(c.arc_cause_i);
+  cv.arc_side_mode = view_vec(c.arc_side_mode);
+  cv.arc_side_ptr = view_vec(c.arc_side_ptr);
+  cv.arc_side_nets = view_vec(c.arc_side_nets);
+  cv.rec_idx = view_vec(c.rec_idx);
+  cv.has_wires = !c.wire_sink.empty();
+  if (cv.has_wires) {
+    cv.wire_ptr = view_vec(c.wire_ptr);
+    cv.wire_zsplit = view_vec(c.wire_zsplit);
+    cv.wire_sink = view_vec(c.wire_sink);
+    cv.wire_rise_ps = view_vec(c.wire_rise_ps);
+    cv.wire_fall_ps = view_vec(c.wire_fall_ps);
+  }
+  return cv;
+}
+
+// Bind a recorded state (bits: one byte per global net) to a cone, as the
+// Python trial loop did: recorded nets from the state (others 0), nets outside
+// the recording settled through their gates in cone order, wire pin nodes
+// copied from their drivers; dp_base = fault-free value of each recorded D net.
+static void bind_state(const setfi_fast::CompiledCone& c, const uint8_t* bits, int64_t n_glob,
+                       std::vector<uint8_t>& net_val, std::vector<uint8_t>& dp_base) {
+  const size_t n = c.gidx.size();
+  net_val.resize(n);
+  for (size_t i = 0; i < n; i++) {
+    const int32_t g = c.gidx[i];
+    if (g >= n_glob) throw std::out_of_range("run_block: global net index beyond the recorded state");
+    net_val[i] = (g >= 0) ? bits[g] : 0;
+  }
+  for (size_t s = 0; s < c.settle_gate.size(); s++) {
+    const int32_t gi = c.settle_gate[s];
+    int64_t idx = 0;
+    int j = 0;
+    for (int32_t k = c.settle_in_ptr[s]; k < c.settle_in_ptr[s + 1]; k++, j++) {
+      if (j >= 62) throw std::out_of_range("run_block: gate with too many inputs to settle");
+      idx |= (int64_t)(net_val[(size_t)c.settle_in[(size_t)k]] & 1) << j;
+    }
+    const int32_t ta = c.gate_truth_ptr[(size_t)gi], tb = c.gate_truth_ptr[(size_t)gi + 1];
+    uint8_t v;
+    if (tb - ta > 1) {
+      if (idx >= (int64_t)(tb - ta)) throw std::out_of_range("run_block: truth table index out of range");
+      v = c.gate_truth[(size_t)(ta + idx)];
+    } else if (tb - ta == 1) {
+      v = c.gate_truth[(size_t)ta];
+    } else {
+      throw std::out_of_range("run_block: empty truth table");
+    }
+    net_val[(size_t)c.gate_out[(size_t)gi]] = (uint8_t)(v & 1);
+  }
+  for (size_t w = 0; w < c.wp_drv.size(); w++)
+    net_val[(size_t)c.wp_sink[w]] = (uint8_t)(net_val[(size_t)c.wp_drv[w]] & 1);
+  dp_base.resize(c.dp_g.size());
+  for (size_t k = 0; k < c.dp_g.size(); k++) {
+    const int64_t g = c.dp_g[k];
+    if (g >= n_glob) throw std::out_of_range("run_block: global net index beyond the recorded state");
+    dp_base[k] = (g >= 0) ? bits[g] : 0;
+  }
+}
+
+// per-site counters returned by run_block (columns of "site_stats"; the
+// order of setfi.campaign.run.SITE_STATS)
+enum SiteStat {
+  ST_N_SIMS, ST_APPLIED, ST_C_REPLACE, ST_C_BACK, ST_KEPT_SAME, ST_COAL_NETS, ST_COAL_EVENTS,
+  ST_DROP_NO_DELAY, ST_DROP_NO_CAND, ST_MAX_HEAP, ST_REACHING_D, ST_WITH_RECORDS, ST_N
+};
+
+// The cycle and width_ps columns of a record are int32 (setfi.records.COLUMNS).
+// As in the Python trial loop with a current NumPy (np.full(..., np.int32)
+// raises in NumPy 2.2 and later; NumPy 2.0 and earlier wrap the value), a value
+// outside that range is an error only when a record would hold it.
+static int32_t record_int32(int64_t v, const char* what) {
+  if (v < std::numeric_limits<int32_t>::min() || v > std::numeric_limits<int32_t>::max())
+    throw std::overflow_error("Python integer " + std::to_string(v) + " out of bounds for int32 (" + what + ")");
+  return (int32_t)v;
+}
+
+// what one thread produced, plus its scratch space
+struct BlockThreadOut {
+  std::vector<int32_t> cycle, site, width, ff;
+  std::vector<uint8_t> base;
+  std::vector<int64_t> t_enter, t_exit;
+  std::vector<uint8_t> net_val, dp_base;
+  std::vector<int32_t> eptr;
+  std::vector<int64_t> et;
+  std::vector<uint8_t> ev;
+  RecEvents rec_events;
+  std::exception_ptr error;
+  int64_t error_item = -1;
+};
+
+static py::dict run_block(py::list cones_list,
+                          py::array_t<uint8_t, py::array::c_style | py::array::forcecast> states,
+                          I64Arr cycles_arr, I32Arr site_ids_arr, I64Arr pw_ps_array,
+                          py::object delaytab_obj, py::dict options, int64_t inf_ps, int n_threads) {
+  const EngineOptions opt = engine_options_from(options);
+  std::vector<py::object> keep;
+  const DelayView dv = delay_view_of(delaytab_obj, keep);
+
+  const int64_t n_sites = (int64_t)py::len(cones_list);
+  std::vector<const setfi_fast::CompiledCone*> cones((size_t)n_sites);
+  for (int64_t j = 0; j < n_sites; j++)
+    cones[(size_t)j] = &py::cast<const setfi_fast::CompiledCone&>(cones_list[(size_t)j]);
+
+  if (states.ndim() != 2) throw std::runtime_error("run_block: states must be [n_cycles, n_nets]");
+  if (cycles_arr.ndim() != 1 || site_ids_arr.ndim() != 1 || pw_ps_array.ndim() != 1)
+    throw std::runtime_error("run_block: cycles, site_ids and pulse widths must be 1-D");
+  const int64_t n_cyc = (int64_t)cycles_arr.shape(0);
+  if ((int64_t)states.shape(0) != n_cyc) throw std::runtime_error("run_block: one state row per cycle");
+  if ((int64_t)site_ids_arr.shape(0) != n_sites) throw std::runtime_error("run_block: one site id per cone");
+  const int64_t n_glob = (int64_t)states.shape(1);
+  const uint8_t* states_p = states.data();
+  const int64_t* cycles = cycles_arr.data();
+  const int32_t* site_ids = site_ids_arr.data();
+  const int64_t n_pw = (int64_t)pw_ps_array.shape(0);
+  const int64_t* pws = pw_ps_array.data();
+
+  int nt = n_threads < 1 ? 1 : n_threads;
+  if ((int64_t)nt > n_sites) nt = (int)std::max<int64_t>(1, n_sites);
+
+  // per item (cycle k, site j), k-major: where its records are
+  const size_t n_items = (size_t)(n_cyc * n_sites);
+  std::vector<int64_t> rec_start(n_items, 0), rec_count(n_items, 0);
+  std::vector<int32_t> thread_of((size_t)n_sites, 0);
+  std::vector<int64_t> site_stats((size_t)n_sites * ST_N, 0);
+  std::vector<BlockThreadOut> outs((size_t)nt);
+  // largest cones first, so that no thread is left with a big one at the end;
+  // the processing order does not affect the result
+  std::vector<int64_t> order((size_t)n_sites);
+  for (int64_t j = 0; j < n_sites; j++) order[(size_t)j] = j;
+  if (nt > 1) {
+    auto size_of = [&](int64_t j) {
+      return (int64_t)cones[(size_t)j]->gate_var_nets.size() + (int64_t)cones[(size_t)j]->rec_idx.size();
+    };
+    std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) { return size_of(a) > size_of(b); });
+  }
+  std::atomic<int64_t> next_site{0};
+  std::atomic<bool> stop{false};
+  bool interrupted = false;  // a Python signal handler raised (set by thread 0, the caller)
+  setfi_fast::SignalPoll poll;
+
+  auto work = [&](int tid) {
+    BlockThreadOut& o = outs[(size_t)tid];
+    for (;;) {
+      if (stop.load()) return;
+      if (tid == 0 && poll.pending()) {
+        interrupted = true;
+        stop.store(true);
+        return;
+      }
+      const int64_t q = next_site.fetch_add(1);
+      if (q >= n_sites) return;
+      const int64_t j = order[(size_t)q];
+      thread_of[(size_t)j] = tid;
+      const setfi_fast::CompiledCone& c = *cones[(size_t)j];
+      const ConeView cv = cone_view_of(c);
+      const int32_t n_ff = c.n_ff();
+      const int32_t n_dp = (int32_t)c.dp_rec_slot.size();
+      int64_t* S = &site_stats[(size_t)j * ST_N];
+      for (int64_t k = 0; k < n_cyc; k++) {
+        const size_t item = (size_t)(k * n_sites + j);
+        rec_start[item] = (int64_t)o.cycle.size();
+        try {
+          bind_state(c, states_p + (size_t)(k * n_glob), n_glob, o.net_val, o.dp_base);
+          const int32_t v0 = (int32_t)(o.net_val[(size_t)c.src_i] & 1);
+          simulate_pulses_core(
+              cv, dv, o.net_val.data(), c.src_i, v0, v0 ^ 1, pws, n_pw, opt.sim_end_ps, opt.eps_ps,
+              opt.delay_policy_is_max, o.rec_events, [&](int64_t pw_idx, const SimStats& st) {
+            S[ST_N_SIMS] += 1;
+            S[ST_APPLIED] += st.applied_events;
+            S[ST_C_REPLACE] += st.canceled_replace;
+            S[ST_C_BACK] += st.canceled_back_to_current;
+            S[ST_KEPT_SAME] += st.kept_same_target;
+            S[ST_COAL_NETS] += st.coalesced_nets;
+            S[ST_COAL_EVENTS] += st.coalesced_events;
+            S[ST_DROP_NO_DELAY] += st.dropped_arc_no_delay;
+            S[ST_DROP_NO_CAND] += st.dropped_no_candidate_arc;
+            S[ST_MAX_HEAP] = std::max(S[ST_MAX_HEAP], st.max_heap);
+            if (n_ff == 0 || n_dp == 0) return;
+            // the CSR event stream simulate_pulses returns
+            const int32_t n_slots = (int32_t)o.rec_events.size();
+            o.eptr.resize((size_t)n_slots + 1);
+            o.eptr[0] = 0;
+            int64_t total = 0;
+            for (int32_t i = 0; i < n_slots; i++) {
+              total += (int64_t)o.rec_events[(size_t)i].size();
+              o.eptr[(size_t)i + 1] = (int32_t)total;
+            }
+            if (total == 0) return;
+            S[ST_REACHING_D] += 1;
+            o.et.resize((size_t)total);
+            o.ev.resize((size_t)total);
+            int64_t pos = 0;
+            for (int32_t i = 0; i < n_slots; i++) {
+              for (auto& pr : o.rec_events[(size_t)i]) {
+                o.et[(size_t)pos] = pr.first;
+                o.ev[(size_t)pos] = (uint8_t)(pr.second & 1);
+                pos++;
+              }
+            }
+            // one record per (pulse at a D net, observed FF on that net)
+            int32_t cyc32 = 0, pw32 = 0;
+            int64_t n_rec = 0;
+            for_each_dp_pulse(o.eptr.data(), n_slots + 1, o.et.data(), o.ev.data(), c.dp_rec_slot.data(),
+                              o.dp_base.data(), n_dp, inf_ps, [&](int32_t dpi, int64_t ta, int64_t tb) {
+              for (int32_t kk = c.dp_ptr[(size_t)dpi]; kk < c.dp_ptr[(size_t)dpi + 1]; kk++) {
+                if (n_rec == 0) {
+                  cyc32 = record_int32(cycles[k], "cycle");
+                  pw32 = record_int32(pws[pw_idx], "pulse width");
+                }
+                o.cycle.push_back(cyc32);
+                o.site.push_back(site_ids[j]);
+                o.width.push_back(pw32);
+                o.ff.push_back(c.ffids[(size_t)c.dp_idx[(size_t)kk]]);
+                o.base.push_back(o.dp_base[(size_t)dpi]);
+                o.t_enter.push_back(ta);
+                o.t_exit.push_back(tb);
+                n_rec++;
+              }
+            });
+            if (n_rec > 0) S[ST_WITH_RECORDS] += 1;
+          });
+        } catch (...) {
+          if (!o.error || (int64_t)item < o.error_item) {
+            o.error = std::current_exception();
+            o.error_item = (int64_t)item;
+          }
+          rec_count[item] = 0;
+          break;
+        }
+        rec_count[item] = (int64_t)o.cycle.size() - rec_start[item];
+      }
+    }
+  };
 
   {
     py::gil_scoped_release release;
-    const int32_t n_rec_ptr = (int32_t)ev_ptr.shape(0);
-
-    auto process_interval = [&](int base, int64_t a_rel, int64_t b_rel, int32_t lp_a, int32_t lp_b) {
-      for (int32_t kk = lp_a; kk < lp_b; ++kk) {
-        const int32_t li = lp_idx[kk];
-        if ((uint32_t)li >= (uint32_t)n_rff) continue;
-        const int64_t te = thr_enter[base * n_rff + li];
-        const int64_t tl = thr_leave[base * n_rff + li];
-        const int64_t s_high = te - a_rel - 1;
-        int32_t i0 = 0, i1 = 0;
-        if (b_rel == inf_ps) {
-          if (s_high < starts0) continue;
-          i0 = 0;
-          i1 = (s_high >= startsN) ? n_st : upper_bound_i64(starts, n_st, s_high);
-        } else {
-          const int64_t s_low = tl - b_rel + 1;
-          if (s_high < starts0 || s_low > startsN) continue;
-          i0 = (s_low <= starts0) ? 0 : lower_bound_i64(starts, n_st, s_low);
-          i1 = (s_high >= startsN) ? n_st : upper_bound_i64(starts, n_st, s_high);
-        }
-        if (i0 < i1) {
-          const size_t off = (size_t)li * row_len;
-          diffs[off + (size_t)i0] += 1;
-          diffs[off + (size_t)i1] -= 1;
-        }
+    setfi_fast::run_workers(nt, stop, work);
+  }
+  if (interrupted) throw py::error_already_set();
+  {
+    // the error the sequential loop would have met first
+    int64_t first = -1;
+    std::exception_ptr err;
+    for (auto& o : outs)
+      if (o.error && (first < 0 || o.error_item < first)) {
+        first = o.error_item;
+        err = o.error;
       }
-    };
+    if (err) std::rethrow_exception(err);
+  }
 
-    for (int32_t dpi = 0; dpi < n_dp; ++dpi) {
-      const int32_t rec_slot = dp_slot[dpi];
-      const int base = (dp_base[dpi] & 1);
-      const int32_t lp_a = lp_ptr[dpi];
-      const int32_t lp_b = lp_ptr[dpi + 1];
-      if (lp_a >= lp_b) continue;
-      if (rec_slot < 0 || rec_slot + 1 >= n_rec_ptr) continue;
-      const int32_t a = eptr[rec_slot];
-      const int32_t b = eptr[rec_slot + 1];
-      if (a >= b) continue;
-      for_each_pulse(et, ev, a, b, base, inf_ps,
-                     [&](int64_t ta, int64_t tb) { process_interval(base, ta, tb, lp_a, lp_b); });
-    }
-
-    for (int32_t li = 0; li < n_rff; ++li) {
-      int64_t acc = 0;
-      const int32_t w = widx[li];
-      if ((uint32_t)w >= (uint32_t)n_words) continue;
-      const uint64_t m = wmsk[li];
-      const size_t off = (size_t)li * row_len;
-      for (int32_t i = 0; i < n_st; ++i) {
-        acc += diffs[off + (size_t)i];
-        if (acc > 0) outp[(size_t)i * (size_t)n_words + (size_t)w] |= m;
+  // gather in k-major order, the order of the Python trial loop
+  int64_t n_total = 0;
+  for (size_t it = 0; it < n_items; it++) n_total += rec_count[it];
+  py::array_t<int32_t> a_cycle((py::ssize_t)n_total), a_site((py::ssize_t)n_total),
+      a_width((py::ssize_t)n_total), a_ff((py::ssize_t)n_total);
+  py::array_t<uint8_t> a_base((py::ssize_t)n_total);
+  py::array_t<int64_t> a_te((py::ssize_t)n_total), a_tx((py::ssize_t)n_total);
+  py::array_t<int64_t> a_off((py::ssize_t)(n_items + 1));
+  {
+    int32_t* pc = a_cycle.mutable_data();
+    int32_t* ps = a_site.mutable_data();
+    int32_t* pw = a_width.mutable_data();
+    int32_t* pf = a_ff.mutable_data();
+    uint8_t* pb = a_base.mutable_data();
+    int64_t* pe = a_te.mutable_data();
+    int64_t* px = a_tx.mutable_data();
+    int64_t* po = a_off.mutable_data();
+    py::gil_scoped_release release;
+    int64_t pos = 0;
+    po[0] = 0;
+    for (int64_t k = 0; k < n_cyc; k++) {
+      for (int64_t j = 0; j < n_sites; j++) {
+        const size_t it = (size_t)(k * n_sites + j);
+        const BlockThreadOut& o = outs[(size_t)thread_of[(size_t)j]];
+        const size_t a = (size_t)rec_start[it], n = (size_t)rec_count[it];
+        std::copy(o.cycle.begin() + a, o.cycle.begin() + a + n, pc + pos);
+        std::copy(o.site.begin() + a, o.site.begin() + a + n, ps + pos);
+        std::copy(o.width.begin() + a, o.width.begin() + a + n, pw + pos);
+        std::copy(o.ff.begin() + a, o.ff.begin() + a + n, pf + pos);
+        std::copy(o.base.begin() + a, o.base.begin() + a + n, pb + pos);
+        std::copy(o.t_enter.begin() + a, o.t_enter.begin() + a + n, pe + pos);
+        std::copy(o.t_exit.begin() + a, o.t_exit.begin() + a + n, px + pos);
+        pos += (int64_t)n;
+        po[it + 1] = pos;
       }
     }
   }
-  return out;
+  outs.clear();
+  outs.shrink_to_fit();
+
+  py::array_t<int64_t> a_stats({(py::ssize_t)n_sites, (py::ssize_t)ST_N});
+  std::copy(site_stats.begin(), site_stats.end(), a_stats.mutable_data());
+
+  py::dict r;
+  r["cycle"] = a_cycle;
+  r["site"] = a_site;
+  r["width_ps"] = a_width;
+  r["ff"] = a_ff;
+  r["base"] = a_base;
+  r["t_enter"] = a_te;
+  r["t_exit"] = a_tx;
+  r["rec_off"] = a_off;
+  r["site_stats"] = a_stats;
+  return r;
 }
 
 }  // namespace
@@ -961,10 +1190,17 @@ PYBIND11_MODULE(_engine, m) {
 
   m.def("simulate_pulses", &simulate_pulses, py::arg("packed"), py::arg("delaytab"),
         py::arg("net_val_init_u8"), py::arg("src_i"), py::arg("v0"), py::arg("v1"),
-        py::arg("pw_ps_array"), py::arg("sim_end_ps"), py::arg("eps_ps"), py::arg("enable_em"),
-        py::arg("margin_ps"), py::arg("delay_policy_is_max"),
+        py::arg("pw_ps_array"), py::arg("sim_end_ps"), py::arg("eps_ps"),
+        py::arg("delay_policy_is_max"),
         R"doc(Inject one SET per pulse width on net src_i (flip v0 -> v1 at t=0,
-back to v0 at t=pw) and propagate it through the packed cone.
+back to v0 at t=pw) and propagate it through the packed cone until sim_end_ps.
+
+eps_ps: events up to eps_ps after the earliest pending one are applied
+together with it (coalesce_window_ps; 0: only simultaneous events).
+delay_policy_is_max: when several inputs of a gate change at once and none has
+an active delay path, use the largest (True) or smallest default delay of the
+inputs that explain the output change (propagation.delay_choice; see
+docs/MODEL.md).
 
 Returns a list with one (ev_ptr, ev_t, ev_v, stats) tuple per pulse width:
 ev_ptr is a CSR pointer over record slots, ev_t / ev_v the time (ps) and new
@@ -979,13 +1215,20 @@ dp_base_u8[dpi]), every excursion away from the fault-free value becomes one
 interval [t_enter, t_exit) in ps after the SET start; a pulse still open when the
 simulation stops gets t_exit = inf_ps.  Returns (dp_index, t_enter, t_exit).)doc");
 
-  m.def("capture_masks", &capture_masks, py::arg("starts_ps"), py::arg("thr_enter_local"),
-        py::arg("thr_leave_local"), py::arg("ev_ptr"), py::arg("ev_t"), py::arg("ev_v"),
-        py::arg("dp_rec_slot"), py::arg("dp_base_u8"), py::arg("dp_localpos_ptr"),
-        py::arg("dp_localpos_idx"), py::arg("word_index"), py::arg("word_mask"),
-        py::arg("n_words"), py::arg("inf_ps"),
-        R"doc(Capture bit masks on a grid of SET start times.
+  m.def("run_block", &run_block, py::arg("cones"), py::arg("states"), py::arg("cycles"),
+        py::arg("site_ids"), py::arg("pw_ps_array"), py::arg("delaytab"), py::arg("options"),
+        py::arg("inf_ps"), py::arg("n_threads") = 1,
+        R"doc(All trials of a block of cycles: for every cone (a CompiledCone), every
+cycle (row of states, one byte per global net) and every pulse width, bind the
+state, propagate, and collect the pulse records.  options holds the propagation
+flags, the trailing arguments of simulate_pulses by name: sim_end_ps, eps_ps
+and delay_policy_is_max.
 
-Returns uint64[n_starts, n_words]; bit li of row i is set when the local FF li
-captures a wrong value for a SET starting at starts_ps[i].)doc");
+Returns a dict: the record columns (cycle, site, width_ps, ff, base, t_enter,
+t_exit) in the order of a cycle-major loop over (cycle, cone, width);
+rec_off[k * n_cones + j] .. rec_off[k * n_cones + j + 1] are the records of
+cycle k and cone j; site_stats[j] the trial counters of cone j.)doc");
+
+  setfi_fast::register_cone_compiler(m);
+  setfi_fast::register_patterns(m);
 }

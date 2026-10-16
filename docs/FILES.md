@@ -73,9 +73,39 @@ leave[base] - t_exit + 1  <=  s  <=  enter[base] - t_enter - 1
 Trials without a row reach no observed flip-flop. `src/setfi/records.py` reads
 the format.
 
-`phase_grid_captures.csv` (only with `inject.phase_grid_steps`): for the start
-times `k*T/steps`, one row `cycle,site,start_ps,width_ps,ffs` per SET that
-upsets flip-flops; `ffs` lists their ids, separated by `|`.
+## patterns/
+
+Only with `[patterns] steps` > 0. The SET start times are the grid
+`starts_ps[k]` = k*T/steps for k = 0..steps (rounded half up to integer ps; T is
+`capture_edge_ps`, the clock period). At `starts_ps[k]` a trial (cycle, site,
+width) upsets the set F of flip-flops that one of its records makes capture (the
+rule above). A pattern is a pair (cycle, F) with F not empty; grid points at
+which a trial upsets no flip-flop belong to no pattern.
+
+`patterns.npz` (format `setfi-patterns/1`, numpy arrays only):
+
+| Array | Type | Meaning |
+|---|---|---|
+| `format` | str | `setfi-patterns/1` |
+| `period_ps`, `steps` | int64 | T and the number of grid steps |
+| `starts_ps` | int64[steps + 1] | the grid of start times |
+| `cycles`, `pulse_widths_ps` | int64 | the sampled cycles and the injected widths of the campaign |
+| `sites` | str | the injection sites; `run_site` indexes them |
+| `ff_ids`, `ff_instances` | int32, str | the observed flip-flops: id and instance name |
+| `pattern_cycle` | int32[P] | the cycle of pattern p |
+| `pattern_ff_ptr`, `pattern_ffs` | int64[P + 1], int32 | the flip-flop ids of pattern p, ascending: `pattern_ffs[pattern_ff_ptr[p]:pattern_ff_ptr[p + 1]]` |
+| `pattern_multiplicity` | int64[P] | the number of grid points (site, width, k) of the cycle at which a SET upsets exactly F |
+| `pattern_n_sites` | int32[P] | the number of sites among them |
+| `pattern_run_ptr` | int64[P + 1] | the runs of pattern p: rows `pattern_run_ptr[p]` to `pattern_run_ptr[p + 1] - 1` of the `run_` arrays |
+| `run_site`, `run_width_ps` | int32[R] | the trial of a run: site index and pulse width |
+| `run_k_lo`, `run_k_hi` | int32[R] | first and last grid index of the run: a maximal range of k at which the trial upsets exactly F |
+
+Patterns are sorted by cycle, then by their flip-flop ids (compared as tuples);
+the runs of a pattern by site, width and `run_k_lo`. The run lengths of a
+pattern add up to its multiplicity. `patterns.csv` has one row per pattern,
+`pattern,cycle,multiplicity,n_ffs,n_sites,ffs` (`pattern` is its index p in
+`patterns.npz`, `ffs` its flip-flop ids separated by `|`). `src/setfi/analysis/patterns.py`
+reads the format.
 
 ## analyze/\<name\>/
 

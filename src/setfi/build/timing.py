@@ -1016,7 +1016,8 @@ def build_timing_checks(tcs: List[TimingCheckRow], inst_celltype: Dict[str, str]
 # A wire is NOT a gate.  A pulse crossing it arrives later but is not electrically
 # masked by it -- the sink sees the same width the driver sent.  So an interconnect
 # delay must never be folded into a cell arc: the engine uses that arc for TWO things
-# (t_out = t0 + arc, and deadline = t0 + arc), and only the first is a transport delay.
+# (t_out = t0 + arc, and the inertial filter: a pulse narrower than the arc dies at the
+# gate), and only the first is a transport delay.
 #
 # A sink is TRANSPORTABLE iff a combinational gate in the graph reads it, i.e. its
 # instance is combinational (carries no timing check -- timing checks is per-FF) AND its pin drives

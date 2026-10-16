@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from setfi.analysis.exposure import capture_intervals
+from setfi.analysis.patterns import compute_patterns
 from setfi.campaign.run import CampaignSpec, run_campaign
 from setfi.records import INF_PS, Records
 
@@ -75,9 +76,9 @@ def campaign(tmp_path):
     write_state(str(tmp_path / "state"))
     spec = CampaignSpec(stage_dir=str(tmp_path / "build"), state_dir=str(tmp_path / "state"),
                         cycles=[1, 2], out_dir=str(tmp_path / "out"), clock_period_ps=100,
-                        pulse_widths_ps=[10, 20, 40], phase_grid_steps=100)
+                        pulse_widths_ps=[10, 20, 40])
     run_campaign(spec, log=lambda *a: None)
-    return Records.open(str(tmp_path / "out")), tmp_path
+    return Records.open(str(tmp_path / "out"))
 
 
 def rows(rec):
@@ -88,7 +89,7 @@ def rows(rec):
 
 
 def test_expected_pulses(campaign):
-    rec, _ = campaign
+    rec = campaign
     assert rows(rec) == [
         # cycle 1, SET on n1 (1 -> 0 -> 1): n2 rises after 20 (A1 rise delay), falls
         # after w + 25; a 10-ps pulse dies at u2 (inertial: narrower than its delay)
@@ -103,7 +104,7 @@ def test_expected_pulses(campaign):
 
 
 def test_capture_window(campaign):
-    rec, _ = campaign
+    rec = campaign
     enter, leave = rec.thresholds()
     # base 0: enter = T + hold(rise) = 105, leave = T - setup(fall) = 70
     assert enter[0, 0] == 105 and leave[0, 0] == 70
@@ -117,8 +118,8 @@ def test_capture_window(campaign):
     assert got[(1, "n2", 10)] == (61, 100)
 
 
-def test_phase_grid_matches_records(campaign):
-    rec, tmp = campaign
+def test_pattern_grid_matches_the_capture_intervals(campaign):
+    rec = campaign
     enter, leave = rec.thresholds()
     cols = rec.load_all()
     keep, lo, hi = capture_intervals(cols, enter, leave, 101)
@@ -127,9 +128,9 @@ def test_phase_grid_matches_records(campaign):
         for s in range(a, b):
             from_records.add((int(cols["cycle"][i]), rec.sites[int(cols["site"][i])], s,
                               int(cols["width_ps"][i])))
-    grid = set()
-    for line in open(tmp / "out" / "phase_grid_captures.csv").read().splitlines()[1:]:
-        c, s, st, pw, ffs = line.split(",")
-        assert ffs == "0"
-        grid.add((int(c), s, int(st), int(pw)))
+    pt = compute_patterns(rec, steps=100)          # start times 0, 1, .., 100 ps
+    assert [pt.ffs(p) for p in range(pt.count)] == [[0]] * pt.count
+    g = pt.grid_points()
+    grid = {(c, rec.sites[s], start, w) for c, s, start, w in
+            zip(g["cycle"].tolist(), g["site"].tolist(), g["start_ps"].tolist(), g["width_ps"].tolist())}
     assert grid == from_records

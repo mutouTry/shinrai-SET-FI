@@ -205,15 +205,11 @@ allow_missing_timing_checks = false
 # --------------------------------------------------------------------------------------
 # How a pulse propagates through the gates. Used by: inject.
 [propagation]
-# When several inputs of a gate change at the same instant and each explains the output
-# change, use the largest or smallest arc delay. One of: max | min.
+# Delay of a gate output change when several inputs change at the same instant and none
+# of them has an active SDF path (each arc has COND entries and none holds): the largest
+# or the smallest default delay of the inputs that explain the change. With an active
+# path, the smallest active delay is used (docs/MODEL.md). One of: max | min.
 delay_choice = "max"
-# Inertial filtering: an output transition is cancelled when its cause reverts before
-# the gate delay has elapsed.
-electrical_masking = true
-# Added to the gate delay when deciding whether a pulse is filtered (ps); positive
-# filters more.
-em_margin_ps = 0
 # Which value of SDF (min:typ:max) triples to use: late = max, early = min. One of: late
 # | early. Used by: build.
 sdf_rail = "late"
@@ -226,13 +222,20 @@ horizon_factor = 1.25
 # --------------------------------------------------------------------------------------
 # How the injection campaign runs. Used by: inject.
 [inject]
-# Parallel processes (does not change the results).
+# Parallel threads (does not change the results).
 jobs = 1
 # Cycles per record file; bounds memory (does not change the results).
 cycles_per_shard = 10
-# If > 0, also write inject/phase_grid_captures.csv: for start times k*T/steps (k =
-# 0..steps), the flip-flops that capture.
-phase_grid_steps = 0
+
+# --------------------------------------------------------------------------------------
+# Which flip-flops SETs upset together, and where from. Used by: patterns.
+[patterns]
+# If > 0, `setfi run` also writes patterns/: for SET start times k*T/steps (k =
+# 0..steps), the sets of flip-flops upset together, each with the trials and start times
+# that give it (`setfi patterns` runs this stage alone).
+steps = 0
+# Parallel threads (does not change the results).
+jobs = 1
 
 # --------------------------------------------------------------------------------------
 # How upset probabilities are computed. Used by: analyze.

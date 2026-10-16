@@ -5,6 +5,7 @@ Stages, in order (each reads the output of the previous ones):
   build     netlist + cell functions + SDF       ->  <dir>/build/
   record    testbench simulation, cycle states   ->  <dir>/record/
   inject    SET campaign, pulse records          ->  <dir>/inject/
+  patterns  flip-flops upset together (optional) ->  <dir>/patterns/
   analyze   upset probabilities                  ->  <dir>/analyze/<width model>/
 
 `setfi run` runs every stage that is out of date: a stage is re-run when a
@@ -29,10 +30,13 @@ from . import config as C
 STAGES = list(C.STAGES)
 STAMPS = "stages.json"
 # The file that shows a stage's output is present.
-KEY_OUTPUT = {"build": "net_index.json", "record": "cycles.json", "inject": "index.json"}
+KEY_OUTPUT = {"build": "net_index.json", "record": "cycles.json", "inject": "index.json",
+              "patterns": "patterns.npz"}
 # What each stage reads from earlier stages: (stage, output digest name).
 UPSTREAM = {"build": [], "record": [("build", "nets")],
-            "inject": [("build", "graph"), ("record", "states")], "analyze": [("inject", "pulses")]}
+            "inject": [("build", "graph"), ("record", "states")], "patterns": [("inject", "pulses")],
+            "analyze": [("inject", "pulses")]}
+PATTERN_FILES = ["patterns.npz", "patterns.csv"]
 INCLUDE_RE = re.compile(r'^\s*`include\s+"([^"]+)"', re.M)
 
 
@@ -199,6 +203,8 @@ def missing_outputs(cfg, stage: str) -> List[str]:
         elif stage == "inject":
             with open(os.path.join(d, "index.json")) as f:
                 need = ["index.json"] + [s["file"] for s in json.load(f)["shards"]]
+        elif stage == "patterns":
+            need = list(PATTERN_FILES)
     except (OSError, ValueError, KeyError):
         return [KEY_OUTPUT.get(stage, "")]
     return [n for n in need if not os.path.exists(os.path.join(d, n))]
@@ -329,16 +335,42 @@ def do_inject(cfg, force: bool = True) -> None:
     except (OSError, ValueError, KeyError):
         before = None
     fp = _begin(cfg, "inject")
-    a = paths(cfg)["analyze"]
+    derived = [paths(cfg)["patterns"], paths(cfg)["analyze"]]     # results computed from the records
     try:
         idx = run_campaign(campaign_spec_from_config(cfg, paths(cfg)))
     except BaseException:
-        shutil.rmtree(a, ignore_errors=True)     # it described the replaced records
+        for d in derived:
+            shutil.rmtree(d, ignore_errors=True)     # they described the replaced records
         raise
     _finish(cfg, "inject", fp, idx["counts"])
-    if os.path.isdir(a) and read_stamps(cfg)["inject"]["outputs"]["pulses"] != before:
-        shutil.rmtree(a)
-        print(f"[inject] removed {a}: it described the previous pulse records")
+    if read_stamps(cfg)["inject"]["outputs"]["pulses"] != before:
+        for d in filter(os.path.isdir, derived):
+            shutil.rmtree(d)
+            print(f"[inject] removed {d}: it described the previous pulse records")
+
+
+def do_patterns(cfg, force: bool = True) -> None:
+    """The pattern table of the pulse records (setfi.analysis.patterns)."""
+    steps = cfg["patterns"]["steps"]
+    if steps < 1:
+        raise SetfiCLIError("[patterns] steps is 0: set it to the number of steps of the start-time "
+                            "grid, e.g. 50")
+    _require(cfg, "inject", "patterns")
+    if _skip(cfg, "patterns", force):
+        return
+    from .analysis.patterns import compute_patterns
+    fp = _begin(cfg, "patterns")
+    t0 = time.time()
+    pt = compute_patterns(paths(cfg)["inject"], steps, jobs=cfg["patterns"]["jobs"])
+    out = paths(cfg)["patterns"]
+    os.makedirs(out, exist_ok=True)
+    pt.save(os.path.join(out, "patterns.npz"))
+    pt.to_csv(os.path.join(out, "patterns.csv"))
+    summary = {"patterns": pt.count, "runs": int(pt.run_site.size),
+               "grid_points_with_upsets": int(pt.pattern_multiplicity.sum())}
+    _finish(cfg, "patterns", fp, summary)
+    print(f"[patterns] {pt.count:,} patterns from {summary['grid_points_with_upsets']:,} grid points "
+          f"that upset flip-flops ({steps} steps), in {time.time() - t0:.1f}s -> {out}")
 
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -411,6 +443,9 @@ def do_status(cfg) -> None:
     stamps = read_stamps(cfg)
     pending: List[str] = []           # earlier stages that will run
     for st in STAGES[:-1]:
+        if st == "patterns" and not cfg["patterns"]["steps"]:
+            print(f"{st:8s} not computed ([patterns] steps = 0)")
+            continue
         ok, why = stage_status(cfg, st, stamps)
         when = (stamps.get(st) or {}).get("finished_utc", "")
         deps = [up for up, _ in UPSTREAM[st] if up in pending]
@@ -454,6 +489,7 @@ def main(argv: Optional[List[str]] = None) -> int:
              "build": "build the timing graph (<dir>/build/)",
              "record": "record the circuit state of sampled cycles (<dir>/record/)",
              "inject": "run the SET campaign (<dir>/inject/)",
+             "patterns": "compute the pattern table (<dir>/patterns/)",
              "analyze": "compute upset probabilities (<dir>/analyze/)",
              "run": "run every out-of-date stage, then analyze"}
     for cmd, h in helps.items():
@@ -465,7 +501,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 '\'{"type": "exponential", "tau_ps": 40}\'')
             p.add_argument("--name", help="directory name under <dir>/analyze/ (default: from "
                                           "the width model)")
-        if cmd in ("build", "record", "inject", "run"):
+        if cmd in ("build", "record", "inject", "patterns", "run"):
             p.add_argument("--force", action="store_true",
                            help="re-run even if up to date" if cmd != "run" else "re-run every stage")
     args = ap.parse_args(argv)
@@ -510,12 +546,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             do_record(cfg, args.force)
         elif args.cmd == "inject":
             do_inject(cfg, args.force)
+        elif args.cmd == "patterns":
+            do_patterns(cfg, args.force)
         elif args.cmd == "analyze":
             do_analyze(cfg, args.name, from_option=bool(args.width_model))
         elif args.cmd == "run":
             do_build(cfg, args.force)
             do_record(cfg, args.force)
             do_inject(cfg, args.force)
+            if cfg["patterns"]["steps"]:
+                do_patterns(cfg, args.force)
             do_analyze(cfg)
     except _errors() as e:
         print(f"setfi {args.cmd}: {e}", file=sys.stderr)

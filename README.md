@@ -15,6 +15,7 @@ which flip-flops capture a wrong value.
 | `build` | netlist, SDF, cell functions | `build/`: timing graph, injection sites, fan-out cones |
 | `record` | `build/`, testbench, simulator | `record/`: circuit state of the sampled cycles |
 | `inject` | `build/`, `record/`, pulse widths | `inject/`: one record per pulse arriving at a flip-flop data pin |
+| `patterns` | `inject/` | `patterns/`: the sets of flip-flops upset together, and where from (optional) |
 | `analyze` | `inject/`, width models | `analyze/<width model>/`: upset probabilities |
 
 Propagation accounts for logical masking, inertial (electrical) filtering,
@@ -85,7 +86,7 @@ width_models = [{ type = "gaussian", mean_ps = 90, sd_ps = 40 },
                 { type = "exponential", tau_ps = 40 }]
 ```
 
-Each stage can be run alone: `setfi build | record | inject | analyze -c setfi.toml`.
+Each stage can be run alone: `setfi build | record | inject | patterns | analyze -c setfi.toml`.
 A stage runs only if a configuration key it reads (the template says which),
 one of its input files, or the result of an earlier stage has changed
 (`--force` runs it anyway). Width models only weight the pulse records, so
@@ -106,6 +107,7 @@ keeps the cycles of the smaller sample and adds new ones.
   build/          timing graph, injection sites and fan-out cones, read by inject
   record/         states/cycle_<N>.hex: the circuit state of each sampled cycle
   inject/         pulse records
+  patterns/       patterns.npz, patterns.csv (with [patterns] steps > 0)
   analyze/
     <model>/      summary.json, per_ff.csv, per_site.csv, per_width.csv
 ```
@@ -116,13 +118,30 @@ Every file is described in [docs/FILES.md](docs/FILES.md).
 deleted to save space: the pulse records stay valid, and a later `setfi run`
 re-creates `build/` and `record/` without redoing the campaign. When an input has
 changed since the campaign, `analyze` says so. A campaign whose pulse records
-differ from the previous ones deletes `analyze/`.
+differ from the previous ones deletes `analyze/` and `patterns/`.
 
 One output directory holds one campaign: changing a key that `inject` reads
 replaces the campaign (`setfi status` shows what a run would redo). To compare
 campaign settings (pulse widths, clock period, propagation options), copy the
 output directory, point a second configuration at the copy and change it there:
 stages the change does not affect are reused. Width models need no new campaign.
+
+## Outputs
+
+| File | Content |
+|---|---|
+| `inject/index.json`, `inject/records_*.npz` | The pulse records: one row per pulse that reaches the data pin of an observed flip-flop in a trial (cycle, site, width). Everything else is computed from them. |
+| `analyze/<model>/` | Upset probabilities for one pulse-width model: `summary.json`, `per_ff.csv`, `per_site.csv`, `per_width.csv`. |
+| `patterns/patterns.npz` | The pattern table, for SET start times on the grid k*T/steps (`[patterns] steps`, k = 0..steps): each set F of flip-flops that SETs upset together in a cycle, the number of grid points (site, width, k) at which a SET upsets exactly F, and those points as runs of consecutive k per trial (`Patterns.grid_points()` expands them, one row per point). |
+| `patterns/patterns.csv` | One row per pattern: cycle, multiplicity, number of flip-flops, number of sites, flip-flop ids. |
+
+```python
+from setfi.analysis.patterns import Patterns
+pt = Patterns.load("runs/my_top/patterns/patterns.npz")
+print(pt.count, pt.cycle(0), pt.multiplicity(0), pt.ffs(0, names=True), pt.sources(0)[:3])
+```
+
+[docs/FILES.md](docs/FILES.md) gives the format of every file.
 
 ## License
 
