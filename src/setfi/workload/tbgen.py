@@ -37,7 +37,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .errors import WorkloadError
 from .sampling import n_hex_digits
@@ -89,24 +89,6 @@ def state_nets(ff_index: Dict, idx_to_net: Dict[int, str]) -> Set[str]:
             if n:
                 out.add(n)
     return out
-
-
-def verify_xmr_resolves(netlist_text: str, taps: Sequence[str]) -> List[str]:
-    """Return the taps whose leaf identifier does not occur in the netlist text.
-
-    Leaf = the last component after '.' or '/', with trailing bus subscripts
-    stripped; synthetic concatenation / cast taps are skipped.  A cheap gate
-    run before the simulator, which would otherwise fail at elaboration.
-    """
-    missing: List[str] = []
-    for tap in taps:
-        if "{" in tap or "}" in tap or "(" in tap:
-            continue
-        leaf = re.split(r"[./]", tap)[-1]
-        leaf_no_bus = re.sub(r"(\[[^\]]+\])+$", "", leaf) or tap
-        if not re.search(r"\b" + re.escape(leaf_no_bus) + r"\b", netlist_text):
-            missing.append(tap)
-    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +208,84 @@ def resolve_taps(
         )
     return bindings, {"n_unresolved_taps": n_unresolved_other,
                       "n_unresolved_state_taps": 0}
+
+
+# ---------------------------------------------------------------------------
+# Tap check
+# ---------------------------------------------------------------------------
+# An identifier in a port connection or an `assign`, but not the radix letter
+# and digits of a constant such as 1'b0.
+_IDENT_RE = re.compile(r"(?<![\w$'])[A-Za-z_][\w$]*")
+# The net at the end of a reference: a name with an optional bit or part select.
+_NET_REF_RE = re.compile(r"^([A-Za-z_][\w$]*)(?:\[(-?\d+)(?::(-?\d+))?\])?$")
+
+
+def verify_xmr_resolves(bindings: Sequence[TapBinding], tb_dut_inst: str,
+                        modules: Mapping[str, Any], top: str) -> List[Tuple[str, str]]:
+    """Return ``(tap, reason)`` for every binding whose reference names no net.
+
+    ``modules`` is the parsed netlist (``setfi.build.netlist.parse_modules``) and
+    ``top`` the module the testbench instantiates as ``tb_dut_inst``.  The
+    reference ``tb.<dut>.<i1>. ... .<ik>.<net>`` resolves when every ``i`` is an
+    instance of a module of the netlist, inside the module before it, and
+    ``net`` is a port of the last module or a net declared, connected or
+    assigned there.  A select of a declared vector must lie inside its range.
+    Literal and unresolved bindings read no net and are not checked.  Run before
+    the simulator, which would otherwise fail at elaboration.
+    """
+    prefix = f"tb.{tb_dut_inst}."
+    children: Dict[str, Dict[str, str]] = {}
+    nets: Dict[str, Set[str]] = {}
+
+    def children_of(mod: str) -> Dict[str, str]:
+        if mod not in children:
+            children[mod] = {i.name: i.celltype for i in modules[mod].instances}
+        return children[mod]
+
+    def nets_of(mod: str) -> Set[str]:
+        if mod not in nets:
+            m = modules[mod]
+            s = set(m.ports) | set(m.net_ranges)
+            for inst in m.instances:
+                for expr in inst.pin2net.values():
+                    s.update(_IDENT_RE.findall(expr))
+            for lhs, rhs in m.assigns:
+                s.update(_IDENT_RE.findall(lhs))
+                s.update(_IDENT_RE.findall(rhs))
+            nets[mod] = s
+        return nets[mod]
+
+    def problem(path: str) -> Optional[str]:
+        *insts, leaf = path.split(".")
+        mod = top
+        if mod not in modules:
+            return f"no module {mod!r} in the netlist"
+        for name in insts:
+            cell = children_of(mod).get(name)
+            if cell is None:
+                return f"no instance {name!r} in module {mod!r}"
+            if cell not in modules:
+                return f"{name!r} in module {mod!r} is a cell ({cell}), not a module"
+            mod = cell
+        m = _NET_REF_RE.match(leaf)
+        if m is None:
+            return f"{leaf!r} is not a net name"
+        net = m.group(1)
+        if net not in nets_of(mod):
+            return f"no net {net!r} in module {mod!r}"
+        rng = modules[mod].net_ranges.get(net)
+        for sel in m.group(2, 3):
+            if sel is not None and rng is not None and not min(rng) <= int(sel) <= max(rng):
+                return f"bit {sel} is outside {net}[{rng[0]}:{rng[1]}] in module {mod!r}"
+        return None
+
+    out: List[Tuple[str, str]] = []
+    for b in bindings:
+        if b.kind in ("xmr", "resolved"):
+            why = problem(b.expr[len(prefix):])
+            if why is not None:
+                out.append((b.tap, why))
+    return out
 
 
 # ---------------------------------------------------------------------------

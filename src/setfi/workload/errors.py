@@ -9,7 +9,7 @@ ERROR_KINDS = frozenset({
     "sim_timeout",
     "sim_aborted_no_last_marker",   # the wrapper's `final` block did not fire
     "sim_no_first_marker",          # reset never deasserted in pass 1
-    "xmr_unresolved",               # a tap leaf name is absent from the netlist
+    "xmr_unresolved",               # a tap names no net of the netlist hierarchy
     "no_cycles_in_range",           # too few cycles to sample (run / window / unknown-value check)
     "marker_parse_ambiguous",       # more than one first= / last= marker
     "unresolvable_state_tap",       # a flip-flop tap that cannot be read
