@@ -290,6 +290,18 @@ def check_sites(sites: List[str], stage_dir: str) -> None:
     _refuse_unknown_sites(sites, names)
 
 
+def select_sites(sub: Substrate, sites: Optional[List[str]], stage_dir: str) -> List[str]:
+    """The injection sites of a campaign, sorted: `sites` (refused if one is not an
+    injection site), or every site if `sites` is empty."""
+    if not sites:
+        return sorted(sub.skeleton)
+    if isinstance(sub.skeleton, SiteCones):    # the same names check_sites reads
+        _refuse_unknown_sites(list(sites), set(sub.skeleton))
+    else:
+        check_sites(list(sites), stage_dir)
+    return sorted(set(sites))
+
+
 def _refuse_unknown_sites(sites: List[str], names) -> None:
     import difflib
     from .substrate import SubstrateError
@@ -312,15 +324,7 @@ def run_campaign(spec: CampaignSpec, log=print) -> Dict:
                          allow_missing_timing_checks=spec.allow_missing_timing_checks,
                          n_threads=None if reference else max(1, int(spec.jobs)))
     timing = {"load": time.time() - t0}
-    all_sites = sorted(sub.skeleton)
-    if spec.sites:
-        if isinstance(sub.skeleton, SiteCones):    # the same names check_sites reads
-            _refuse_unknown_sites(list(spec.sites), set(sub.skeleton))
-        else:
-            check_sites(list(spec.sites), spec.stage_dir)
-        sites = sorted(set(spec.sites))
-    else:
-        sites = all_sites
+    sites = select_sites(sub, spec.sites, spec.stage_dir)
     site_index = {s: i for i, s in enumerate(sites)}
     os.makedirs(spec.out_dir, exist_ok=True)
     for f in os.listdir(spec.out_dir):          # a previous campaign's files must not survive

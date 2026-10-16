@@ -53,11 +53,12 @@ SECTIONS = {
     "propagation": "How a pulse propagates through the gates.",
     "inject": "How the injection campaign runs.",
     "patterns": "Which flip-flops SETs upset together, and where from.",
+    "logic": "Which flip-flops a SET upsets, without timing (`setfi logic`).",
     "analyze": "How upset probabilities are computed.",
     "build": "Advanced options of the netlist and SDF reader.",
 }
 
-STAGES = ("build", "record", "inject", "patterns", "analyze")
+STAGES = ("build", "record", "inject", "patterns", "logic", "analyze")
 
 # The configuration each stage reads: whole sections, or (section, key) pairs.  A
 # stage is re-run when one of these values (for files: their content) changes.
@@ -72,11 +73,13 @@ STAGE_KEYS = {
                ("library", "timing_check_clock_pins"),
                ("observe", "allow_missing_timing_checks")],
     "patterns": ["patterns"],
+    "logic": ["logic", ("fault_model", "sites"), ("library", "timing_check_clock_pins"),
+              ("observe", "allow_missing_timing_checks")],
     "analyze": ["analyze"],
 }
 # Keys that change how a stage runs, not its result.
 EXECUTION_ONLY = {("inject", "jobs"), ("inject", "cycles_per_shard"), ("patterns", "jobs"),
-                  ("workload", "compile_timeout_s"), ("workload", "sim_timeout_s")}
+                  ("logic", "jobs"), ("workload", "compile_timeout_s"), ("workload", "sim_timeout_s")}
 
 
 def stage_keys(stage: str, cfg: Dict[str, Dict[str, Any]]) -> List[Tuple[str, str]]:
@@ -96,16 +99,16 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
     "design": {
         "netlist": _k("path", REQUIRED, "Gate-level netlist (structural Verilog, named port "
                       "connections).", "design/mapped.v"),
-        "sdf": _k("path", REQUIRED, "SDF of that netlist; its (DESIGN ...) must equal `top`.",
+        "sdf": _k("path", REQUIRED, "SDF of that netlist. Its (DESIGN ...) must equal `top`.",
                   "design/mapped.sdf"),
         "top": _k("str", REQUIRED, "Top module of the netlist.", "my_top"),
         "clock_period_ns": _k("float", REQUIRED,
                               "Clock period T of the analysis: SET start times are uniform over "
                               "[0, T) and flip-flops capture at T. Normally the period the SDF was "
-                              "timed for; the testbench clock period does not matter.", 1.0),
+                              "timed for. The testbench clock period does not matter.", 1.0),
     },
     "output": {
-        "dir": _k("path", REQUIRED, "Output directory; one sub-directory per stage.",
+        "dir": _k("path", REQUIRED, "Output directory, with one sub-directory per stage.",
                   "runs/my_design"),
     },
     "library": {
@@ -115,12 +118,12 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
         "q_pins": _k("strs", ["Q", "QN", "QB", "Q_N", "QBAR"],
                      "Names of flip-flop output pins (a sequential cell needs one)."),
         "d_pins": _k("strs", ["D", "DI", "DIN", "DATA", "I"],
-                     "Names of flip-flop data pins; the first one a cell has is its data pin."),
+                     "Names of flip-flop data pins. The first one a cell has is its data pin."),
         "clock_pins": _k("strs", ["CP", "CK", "CLK", "CLKN", "G", "E"],
                          "Names of clock pins, used only for cells whose model does not name the "
                          "clock in `always @(posedge/negedge ...)` (e.g. latches)."),
         "async_pins": _k("strs", ["RN", "SN", "R", "S", "RESET", "SET", "CDN", "SDN", "CLRN", "PRN"],
-                         "Names of asynchronous set/reset pins (never taken as the data pin)."),
+                         "Names of asynchronous set/reset pins (not taken as the data pin)."),
         "scan_data_pin_pairs": _k("tables", [{"data": "D", "scan": "SCD"}],
                                   "Data / scan-data pin pairs of scan flip-flops: when the SDF has "
                                   "setup/hold checks for only one pin of a pair, they are copied "
@@ -129,14 +132,14 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
         "untimed_cells": _k("strs", [],
                             "Regular expressions (whole cell name) of cells that have no SDF "
                             "entry. Cells without inputs or without outputs (ties, fillers) are "
-                            "always treated so."),
+                            "treated so as well."),
         "blackbox_cells": _k("strs", [],
                              "Regular expressions (whole cell name) of cells that are neither in "
                              "the library nor defined in the netlist, e.g. memories. They are "
                              "neither injected nor observed."),
         "timing_check_clock_pins": _k("strs", ["CP", "CK", "CLK"],
                                       "Clock pins whose SDF SETUP/HOLD checks give a flip-flop's "
-                                      "sampling window, in order of preference; if none has "
+                                      "sampling window, in order of preference. If none has "
                                       "checks, the one clock pin that has them is used."),
     },
     "workload": {
@@ -148,16 +151,16 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
         "tb_top": _k("str", "testbench", "Top module of the testbench."),
         "dut_instance": _k("str", "dut", "Instance name of the design in `tb_top`."),
         "clock": _k("str", "clk", "Clock signal in `tb_top`."),
-        "reset": _k("str", "rst_n", "Reset signal in `tb_top`; cycles are counted after reset. "
-                                    "Empty: no reset, cycles are counted from the first clock "
-                                    "edge."),
+        "reset": _k("str", "rst_n", "Reset signal in `tb_top`. Cycles are counted after reset. "
+                                    "Empty: no reset, and cycles are counted from the first "
+                                    "clock edge."),
         "reset_active": _k("choice:low|high", "low", "Reset polarity."),
         "cell_sim_models": _k("paths", [],
                               "Verilog simulation models of the library cells, e.g. those "
                               "shipped with the library. Default: the cells of "
                               "library.cell_functions (Liberty files as translated by build "
                               "into build/cell_functions.v)."),
-        "data_files": _k("paths", [], "Files the testbench opens at run time; copied into the "
+        "data_files": _k("paths", [], "Files the testbench opens at run time, copied into the "
                                       "simulation directory."),
         "include_dirs": _k("dirs", [], "Directories searched for `include files, besides the "
                                        "directories of the testbench files."),
@@ -167,9 +170,10 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
         "padding_cycles": _k("int", 5, "Cycles not sampled at the start and end of the run."),
         "warmup_cycles": _k("int", 0, "Further cycles not sampled after reset."),
         "cycle_window_csv": _k("path", None,
-                               "CSV with columns start_cycle,end_cycle (inclusive; cycle N "
-                               "begins at the N-th rising clock edge after reset): sample only "
-                               "inside these windows, e.g. the kernel of a program.", '"windows.csv"'),
+                               "CSV with columns start_cycle,end_cycle, both inclusive. Cycle N "
+                               "begins at the N-th rising clock edge after reset. Cycles are "
+                               "sampled only inside these windows, e.g. the kernel of a "
+                               "program.", '"windows.csv"'),
         "max_x_fraction": _k("float", 0.02,
                              "A sampled cycle whose recorded state has a larger fraction of "
                              "unknown (X/Z) digits is replaced by another cycle."),
@@ -203,7 +207,7 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
         "env_unset": _k("strs", None, "[all] Environment variables removed before the simulator "
                                       "runs, e.g. [\"LD_LIBRARY_PATH\"].", '[]'),
         "timescale": _k("str", None, "[icarus, custom] `timescale for sources that declare "
-                                     "none (icarus default \"1ns/1ps\"; custom default: "
+                                     "none (icarus default \"1ns/1ps\", custom default: "
                                      "none).", '"1ns/1ps"'),
         "iverilog": _k("str", None, "[icarus] iverilog executable (default \"iverilog\").", '"iverilog"'),
         "vvp": _k("str", None, "[icarus] vvp executable (default \"vvp\").", '"vvp"'),
@@ -224,7 +228,7 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
         "include_format": _k("str", None, "[custom] Form of one include directory "
                                           "(default \"+incdir+{dir}\").", '"+incdir+{dir}"'),
         "recorder": _k("choice:strobe|program", None,
-                       "[custom] How the state is sampled: $fstrobe (any simulator) or an SV "
+                       "[custom] How the state is sampled: $fstrobe (standard Verilog) or an SV "
                        "program block.", '"strobe"'),
     },
     "fault_model": {
@@ -250,7 +254,7 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
     },
     "analyze": {
         "width_models": _k("tables", [{"type": "uniform"}],
-                           "Pulse-width distributions; each is analysed into its own "
+                           "Pulse-width distributions. Each is analysed into its own "
                            "directory. A distribution gives each injected width a "
                            "probability: {type = \"uniform\"}, {type = \"gaussian\", mean_ps "
                            "= 90, sd_ps = 40}, {type = \"exponential\", tau_ps = 40}, or {type "
@@ -263,7 +267,7 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
     },
     "inject": {
         "jobs": _k("int", 1, "Parallel threads (does not change the results)."),
-        "cycles_per_shard": _k("int", 10, "Cycles per record file; bounds memory (does not "
+        "cycles_per_shard": _k("int", 10, "Cycles per record file. Bounds memory (does not "
                                           "change the results)."),
     },
     "patterns": {
@@ -272,6 +276,9 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
                     "(k = 0..steps), the sets of flip-flops upset together, each with the "
                     "trials and start times that give it (`setfi patterns` runs this stage "
                     "alone)."),
+        "jobs": _k("int", 1, "Parallel threads (does not change the results)."),
+    },
+    "logic": {
         "jobs": _k("int", 1, "Parallel threads (does not change the results)."),
     },
     "observe": {
@@ -291,7 +298,8 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
         "self_check_samples": _k("int", 50, "Number of cones verified."),
         "self_check_seed": _k("int", 1, "Seed of that sample."),
         "strict_sdf_crosscheck": _k("bool", True, "Fail when netlist and SDF instances differ."),
-        "max_undriven_nets": _k("int", 0, "Nets read by a cell but driven by nothing, tolerated."),
+        "max_undriven_nets": _k("int", 0, "Number of nets read by a cell but driven by nothing "
+                                          "that the build accepts."),
         "keep_intermediates": _k("bool", False, "Keep intermediate files in build/intermediate/."),
         "allow_missing_delays": _k("bool", False,
                                    "Accept gate arcs without an SDF delay inside injection cones "
@@ -303,7 +311,7 @@ EXTRA_SECTIONS: Dict[str, Dict[str, Key]] = {}
 
 # Section order of the template: what every user sets first, advanced knobs last.
 ORDER = ["design", "output", "library", "workload", "simulator", "fault_model", "observe",
-         "propagation", "inject", "patterns", "analyze", "build"]
+         "propagation", "inject", "patterns", "logic", "analyze", "build"]
 
 
 def schema() -> Dict[str, Dict[str, Key]]:
@@ -502,7 +510,7 @@ def validate(cfg: Dict[str, Dict[str, Any]], check_files: bool = True,
                           f"must be a whole number of ps, at least 0.001 ns")
     for sec, key, lo in (("workload", "n_cycles", 1), ("inject", "jobs", 1),
                          ("inject", "cycles_per_shard", 1),
-                         ("patterns", "steps", 0), ("patterns", "jobs", 1),
+                         ("patterns", "steps", 0), ("patterns", "jobs", 1), ("logic", "jobs", 1),
                          ("workload", "padding_cycles", 0), ("workload", "warmup_cycles", 0),
                          ("workload", "reserve_factor", 0)):
         if cfg[sec][key] < lo:
@@ -557,8 +565,8 @@ def _wrap(text: str, width: int = 88) -> List[str]:
 def template() -> str:
     """A complete, commented configuration with every default spelled out."""
     lines = ["# setfi configuration.",
-             "# Relative paths are relative to this file. Keys marked REQUIRED have no default;",
-             "# every other key may be deleted to use its default. \"Used by\" names the stages",
+             "# Relative paths are relative to this file. Keys marked REQUIRED have no default.",
+             "# Every other key may be deleted to use its default. \"Used by\" names the stages",
              "# that read the keys of a section (a key that differs says so): changing a key",
              "# re-runs them.", ""]
     from collections import Counter

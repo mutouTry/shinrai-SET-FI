@@ -6,7 +6,7 @@ setup(
     ext_modules=[
         Pybind11Extension(
             "setfi._engine",
-            ["cpp/engine.cpp", "cpp/cone_compiler.cpp", "cpp/patterns.cpp"],
+            ["cpp/engine.cpp", "cpp/cone_compiler.cpp", "cpp/patterns.cpp", "cpp/logic.cpp"],
             depends=["cpp/fastpath.hpp"],
             cxx_std=17,
             extra_compile_args=["-O3"],

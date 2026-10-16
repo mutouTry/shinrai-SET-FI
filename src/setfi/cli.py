@@ -6,6 +6,7 @@ Stages, in order (each reads the output of the previous ones):
   record    testbench simulation, cycle states   ->  <dir>/record/
   inject    SET campaign, pulse records          ->  <dir>/inject/
   patterns  flip-flops upset together (optional) ->  <dir>/patterns/
+  logic     the same without timing (optional)   ->  <dir>/logic/
   analyze   upset probabilities                  ->  <dir>/analyze/<width model>/
 
 `setfi run` runs every stage that is out of date: a stage is re-run when a
@@ -31,11 +32,11 @@ STAGES = list(C.STAGES)
 STAMPS = "stages.json"
 # The file that shows a stage's output is present.
 KEY_OUTPUT = {"build": "net_index.json", "record": "cycles.json", "inject": "index.json",
-              "patterns": "patterns.npz"}
+              "patterns": "patterns.npz", "logic": "patterns.npz"}
 # What each stage reads from earlier stages: (stage, output digest name).
 UPSTREAM = {"build": [], "record": [("build", "nets")],
             "inject": [("build", "graph"), ("record", "states")], "patterns": [("inject", "pulses")],
-            "analyze": [("inject", "pulses")]}
+            "logic": [("build", "graph"), ("record", "states")], "analyze": [("inject", "pulses")]}
 PATTERN_FILES = ["patterns.npz", "patterns.csv"]
 INCLUDE_RE = re.compile(r'^\s*`include\s+"([^"]+)"', re.M)
 
@@ -203,7 +204,7 @@ def missing_outputs(cfg, stage: str) -> List[str]:
         elif stage == "inject":
             with open(os.path.join(d, "index.json")) as f:
                 need = ["index.json"] + [s["file"] for s in json.load(f)["shards"]]
-        elif stage == "patterns":
+        elif stage in ("patterns", "logic"):
             need = list(PATTERN_FILES)
     except (OSError, ValueError, KeyError):
         return [KEY_OUTPUT.get(stage, "")]
@@ -373,6 +374,26 @@ def do_patterns(cfg, force: bool = True) -> None:
           f"that upset flip-flops ({steps} steps), in {time.time() - t0:.1f}s -> {out}")
 
 
+def do_logic(cfg, force: bool = True) -> None:
+    """The pattern table without timing (setfi.campaign.logic)."""
+    _require(cfg, "build", "logic")
+    _require(cfg, "record", "logic")
+    if _skip(cfg, "logic", force):
+        return
+    from .campaign.logic import run_logic
+    from .campaign.run import check_sites
+    from .pipeline import logic_spec_from_config
+    check_sites(cfg["fault_model"]["sites"], paths(cfg)["build"])
+    fp = _begin(cfg, "logic")
+    pt = run_logic(logic_spec_from_config(cfg, paths(cfg)))
+    out = paths(cfg)["logic"]
+    os.makedirs(out, exist_ok=True)
+    pt.save(os.path.join(out, "patterns.npz"))
+    pt.to_csv(os.path.join(out, "patterns.csv"))
+    _finish(cfg, "logic", fp, {"patterns": pt.count, "sets_with_upsets": int(pt.pattern_multiplicity.sum())})
+    print(f"[logic] -> {out}")
+
+
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -446,6 +467,8 @@ def do_status(cfg) -> None:
         if st == "patterns" and not cfg["patterns"]["steps"]:
             print(f"{st:8s} not computed ([patterns] steps = 0)")
             continue
+        if st == "logic" and st not in stamps:
+            continue                  # listed once `setfi logic` has run
         ok, why = stage_status(cfg, st, stamps)
         when = (stamps.get(st) or {}).get("finished_utc", "")
         deps = [up for up, _ in UPSTREAM[st] if up in pending]
@@ -490,6 +513,7 @@ def main(argv: Optional[List[str]] = None) -> int:
              "record": "record the circuit state of sampled cycles (<dir>/record/)",
              "inject": "run the SET campaign (<dir>/inject/)",
              "patterns": "compute the pattern table (<dir>/patterns/)",
+             "logic": "compute the pattern table without timing (<dir>/logic/)",
              "analyze": "compute upset probabilities (<dir>/analyze/)",
              "run": "run every out-of-date stage, then analyze"}
     for cmd, h in helps.items():
@@ -501,7 +525,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 '\'{"type": "exponential", "tau_ps": 40}\'')
             p.add_argument("--name", help="directory name under <dir>/analyze/ (default: from "
                                           "the width model)")
-        if cmd in ("build", "record", "inject", "patterns", "run"):
+        if cmd in ("build", "record", "inject", "patterns", "logic", "run"):
             p.add_argument("--force", action="store_true",
                            help="re-run even if up to date" if cmd != "run" else "re-run every stage")
     args = ap.parse_args(argv)
@@ -548,6 +572,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             do_inject(cfg, args.force)
         elif args.cmd == "patterns":
             do_patterns(cfg, args.force)
+        elif args.cmd == "logic":
+            do_logic(cfg, args.force)
         elif args.cmd == "analyze":
             do_analyze(cfg, args.name, from_option=bool(args.width_model))
         elif args.cmd == "run":

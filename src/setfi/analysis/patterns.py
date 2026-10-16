@@ -43,6 +43,9 @@ Patterns are sorted by cycle, then by their FF ids (compared as tuples); the
 runs of a pattern by site, width, k_lo.  The table depends only on the records
 and the grid: not on how the records are split into files, nor on ``jobs``.
 
+The logic stage (setfi.campaign.logic) writes tables of the same format without
+a grid or widths: steps = 0, one run per site.
+
     from setfi.analysis.patterns import compute_patterns
     pt = compute_patterns("runs/my_top/inject", steps=50)
     print(pt.count, pt.cycle(0), pt.ffs(0), pt.sources(0)[:3])

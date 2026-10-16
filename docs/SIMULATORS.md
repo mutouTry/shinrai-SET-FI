@@ -8,16 +8,16 @@ clock edge with reset inactive (N = 1, 2, ...).
 
 Requirements on the testbench:
 
-* it instantiates the design as `workload.dut_instance` in `workload.tb_top`,
-  with clock `workload.clock` and reset `workload.reset`;
-* it does not change the design's inputs between a falling and the next rising
-  clock edge (driving them at the falling edge, or just after the rising edge,
-  is fine);
-* it prints `workload.pass_string` (default `RESULT: PASS`) when it passes.
+* It instantiates the design as `workload.dut_instance` in `workload.tb_top`,
+  with clock `workload.clock` and reset `workload.reset`.
+* It does not change the design's inputs between a falling and the next rising
+  clock edge. Driving them at the falling edge, or just after the rising edge,
+  is fine.
+* It prints `workload.pass_string` (default `RESULT: PASS`) when it passes.
 
 The simulation runs twice: first to count the cycles after reset and to check
 the input timing, then to record the sampled ones into `record/states/`. For a
-design without reset, set `workload.reset = ""`; cycles are then counted from
+design without reset, set `workload.reset = ""`. Cycles are then counted from
 the first rising edge.
 
 `` `include`` files are searched in the directories of the testbench files and
@@ -51,10 +51,10 @@ libraries disturb the simulator's link step.
 
 ## Other simulators
 
-With `preset = "custom"`, give the compile and run commands as token lists
-(`include_format` gives the form of an include-directory argument, default
-`+incdir+{dir}`; `timescale` compiles a `` `timescale`` line first, for
-simulators without a command-line default). The placeholders are:
+With `preset = "custom"`, give the compile and run commands as token lists.
+`include_format` gives the form of an include-directory argument (default
+`+incdir+{dir}`). `timescale` compiles a `` `timescale`` line first, for
+simulators without a command-line default. The placeholders are:
 
 | Placeholder | Meaning |
 |---|---|
@@ -63,17 +63,16 @@ simulators without a command-line default). The placeholders are:
 | `{sim_bin}` | compiled simulation to write / run |
 | `{work_dir}`, `{output_dir}` | working and output directories |
 | `{defines}` | defines, each formatted with `define_format` |
-| `{plusargs}` | recorder plusargs; pass them at run time |
+| `{plusargs}` | recorder plusargs, to pass at run time |
 | `{extra_args}`, `{run_args}` | from the same-named keys |
 
-`recorder = "strobe"` samples with `$fstrobe` and works on any simulator;
+`recorder = "strobe"` samples with `$fstrobe`, a standard Verilog task.
 `recorder = "program"` uses an SV `program` block.
 
 ## Adapting the testbench
 
 The testbench is compiled with the gate-level netlist and the cell models
-instead of the RTL. Most testbenches need nothing more. Three situations need
-configuration:
+instead of the RTL. Three situations need configuration:
 
 * **The testbench refers to signals inside the design that synthesis renamed or
   flattened**, e.g. `dut.u_rf.mem[3]` when the netlist has a flat bus
@@ -89,7 +88,7 @@ configuration:
 
   With `auto_derive_substitutions = true` and the design's RTL in `rtl_files`,
   such rewrites are derived from the RTL declarations for references that
-  `tb_substitutions` does not cover; ambiguous references are reported.
+  `tb_substitutions` does not cover. Ambiguous references are reported.
 
 * **The netlist instantiates macros without a model** (memories, IP), which
   `library.blackbox_cells` lets the build treat as black boxes. For the

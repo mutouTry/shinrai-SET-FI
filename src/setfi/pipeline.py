@@ -31,6 +31,17 @@ def campaign_spec_from_config(cfg, paths: Dict[str, str]):
         jobs=inj["jobs"])
 
 
+def logic_spec_from_config(cfg, paths: Dict[str, str]):
+    from .campaign.logic import LogicSpec
+    from .campaign.state import read_sampled_cycles
+    state_dir, meta = state_paths(paths["record"])
+    return LogicSpec(
+        stage_dir=paths["build"], state_dir=state_dir, cycles=read_sampled_cycles(meta),
+        clock_pins=cfg["library"]["timing_check_clock_pins"],
+        allow_missing_timing_checks=cfg["observe"]["allow_missing_timing_checks"],
+        sites=cfg["fault_model"]["sites"] or None, jobs=cfg["logic"]["jobs"])
+
+
 def state_paths(record_dir: str):
     """(states directory, cycles.json) written by the record stage."""
     return os.path.join(record_dir, "states"), os.path.join(record_dir, "cycles.json")
