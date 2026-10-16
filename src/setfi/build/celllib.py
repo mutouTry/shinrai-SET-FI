@@ -491,7 +491,7 @@ def check_used_cells(cells: Dict[str, Cell], used: Set[str]) -> List[str]:
 
     * a cell with state (an ``always`` block) that the pin conventions do not
       recognise as sequential would be treated as combinational logic -- its
-      clock/enable pin must be added to ``library.clock_pin_names``;
+      clock/enable pin must be added to ``library.clock_pins``;
     * a cell recognised as sequential but with no ``always`` block is a
       combinational cell whose pin names look like a flip-flop's;
     * a combinational cell output whose function cannot be parsed, or depends on
@@ -522,7 +522,7 @@ def check_used_cells(cells: Dict[str, Cell], used: Set[str]) -> List[str]:
         if cell.has_always:
             problems.append(f"{name}: its model holds state (always block) but no clock "
                             f"pin was recognised among inputs {cell.inputs}; add the "
-                            f"clock/enable pin to library.clock_pin_names")
+                            f"clock/enable pin to library.clock_pins")
             continue
         _, errors = _parse_assigns(cell)
         asts = resolved_output_asts(cell)

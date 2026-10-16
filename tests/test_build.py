@@ -327,7 +327,7 @@ def test_stateful_cell_needs_its_clock_pin_declared(tmp_path):
     cells["fn0"] = ("DFNX1", "(DELAY (ABSOLUTE (IOPATH (negedge CPN) Q (0.05:0.05:0.05))))")
     extra = "  DFNX1 fn0 ( .D(n2), .CPN(clk), .Q(qn) );"
     spec = write_case(tmp_path, cells=cells, extra=extra)
-    with pytest.raises(BuildError, match=r"DFNX1: its model holds state"):
+    with pytest.raises(BuildError, match=r"DFNX1: its model holds state.*library\.clock_pins"):
         run_build(spec)
     spec = write_case(tmp_path, cells=cells, extra=extra,
                       lib_clock_pin_names=("CP", "CK", "CLK", "CLKN", "G", "E", "CPN"))
