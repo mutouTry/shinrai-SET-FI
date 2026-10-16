@@ -103,10 +103,6 @@ _BIT_SELECT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_$./]*)\[\d+\]$")
 _CHAINED_SELECT_RE = re.compile(r"\]\s*\[")
 # Literal constants surface as taps when an assign ties a net to 1'b0 / 1'b1.
 _LITERAL_CONST_RE = re.compile(r"^\s*(?:\d*'[bB][01xXzZ?]|0|1)\s*$")
-# A bare clock-gate output (`.Q(ENCLK)`) lives inside the gating cell, not at
-# the DUT scope, and the engine models the clock by its capture edge, never by
-# this value: a don't-care, recorded as 0 to keep the bit layout.
-_GATED_CLOCK_LEAF_RE = re.compile(r"^ENCLK$")
 
 
 @dataclass(frozen=True)
@@ -116,7 +112,7 @@ class TapBinding:
     idx: int
     tap: str
     expr: str
-    kind: str          # "xmr" | "resolved" | "literal" | "gated_clock" | "unresolved"
+    kind: str          # "xmr" | "resolved" | "literal" | "unresolved"
     note: str = ""
 
 
@@ -188,10 +184,6 @@ def resolve_taps(
         if _LITERAL_CONST_RE.match(tap):
             bindings.append(TapBinding(idx, tap, tap.strip(), "literal",
                                        f"literal-const: {tap!r}"))
-            continue
-        if "/" not in tap and "." not in tap and _GATED_CLOCK_LEAF_RE.match(tap):
-            bindings.append(TapBinding(idx, tap, "1'b0", "gated_clock",
-                                       f"gated-clock output, not needed: {tap!r}"))
             continue
         bindings.append(TapBinding(idx, tap, f"tb.{tb_dut_inst}.{tap.replace('/', '.')}", "xmr"))
 

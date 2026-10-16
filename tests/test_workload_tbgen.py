@@ -118,8 +118,8 @@ def test_resolve_taps_kinds():
     assert got["a[0]"] == ("xmr", "tb.dut.a[0]")
     assert got["u_dut/q_reg/Q"] == ("xmr", "tb.dut.u_dut.q_reg.Q")
     assert got["1'b1"] == ("literal", "1'b1")
-    assert got["ENCLK"] == ("gated_clock", "1'b0")
-    assert got["u_x/ENCLK"] == ("xmr", "tb.dut.u_x.ENCLK")      # scoped: recorded normally
+    assert got["ENCLK"] == ("xmr", "tb.dut.ENCLK")
+    assert got["u_x/ENCLK"] == ("xmr", "tb.dut.u_x.ENCLK")
     assert got["m[15:0][3]"] == ("resolved", "tb.dut.m[3]")
     assert got["{x[1], y}[0]"] == ("resolved", "tb.dut.y")
     assert got["{x[1], y}[1]"] == ("resolved", "tb.dut.x[1]")
