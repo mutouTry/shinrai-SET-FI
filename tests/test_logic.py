@@ -282,7 +282,8 @@ def write_design(d):
                              + "\nendmodule\n")
     sdf = ['(DELAYFILE (SDFVERSION "3.0") (DESIGN "top") (TIMESCALE 1ns) (DIVIDER /)']
     for f in FF_D:
-        sdf.append(f'  (CELL (CELLTYPE "DFF") (INSTANCE {f}) (DELAY (ABSOLUTE (IOPATH (posedge CP) Q (0.05) (0.05))))'
+        sdf.append(f'  (CELL (CELLTYPE "DFF") (INSTANCE {f})'
+                   ' (DELAY (ABSOLUTE (IOPATH (posedge CP) Q (0.05) (0.05))))'
                    ' (TIMINGCHECK (SETUP (posedge D) (posedge CP) (0.02)) (SETUP (negedge D) (posedge CP) (0.02))'
                    ' (HOLD (posedge D) (posedge CP) (0.005)) (HOLD (negedge D) (posedge CP) (0.005))))')
     for inst, (cell, _) in GATES.items():

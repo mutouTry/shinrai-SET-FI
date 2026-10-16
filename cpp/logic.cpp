@@ -96,14 +96,16 @@ void invert_site(const CompiledCone& c, const uint8_t* row, bool bound, LogicThr
       idx |= (int64_t)value(c.gate_var_nets[(size_t)q]) << j;
     }
     const int32_t ta = c.gate_truth_ptr[(size_t)g], tb = c.gate_truth_ptr[(size_t)g + 1];
-    if (tb - ta > 1 && idx >= (int64_t)(tb - ta)) throw std::out_of_range("logic_block: truth table index out of range");
+    if (tb - ta > 1 && idx >= (int64_t)(tb - ta))
+      throw std::out_of_range("logic_block: truth table index out of range");
     if (tb <= ta) throw std::out_of_range("logic_block: empty truth table");
     const uint8_t y = (uint8_t)(c.gate_truth[(size_t)(tb - ta > 1 ? ta + idx : ta)] & 1);
     if (y != value(now)) set(now, y);
   }
   t.upset.clear();
   for (int32_t dpi : t.hit)
-    for (int32_t k = c.dp_ptr[(size_t)dpi]; k < c.dp_ptr[(size_t)dpi + 1]; k++) t.upset.push_back(c.dp_idx[(size_t)k]);
+    for (int32_t k = c.dp_ptr[(size_t)dpi]; k < c.dp_ptr[(size_t)dpi + 1]; k++)
+      t.upset.push_back(c.dp_idx[(size_t)k]);
   std::sort(t.upset.begin(), t.upset.end());
   t.upset.erase(std::unique(t.upset.begin(), t.upset.end()), t.upset.end());
 }
@@ -175,7 +177,8 @@ py::dict logic_block(py::list cones_list, py::array_t<uint8_t, py::array::c_styl
       t.net_dp.assign(n, -1);
       for (size_t dpi = 0; dpi < c.dp_rec_slot.size(); dpi++) {
         const int32_t slot = c.dp_rec_slot[dpi];
-        if (slot >= 0 && (size_t)slot < n && t.slot_net[(size_t)slot] >= 0) t.net_dp[(size_t)t.slot_net[(size_t)slot]] = (int32_t)dpi;
+        const int32_t net = (slot >= 0 && (size_t)slot < n) ? t.slot_net[(size_t)slot] : -1;
+        if (net >= 0) t.net_dp[(size_t)net] = (int32_t)dpi;
       }
       const bool bound = !c.settle_gate.empty();
       const bool in_state = std::all_of(c.gidx.begin(), c.gidx.end(), [&](int32_t g) { return g < n_glob; });
