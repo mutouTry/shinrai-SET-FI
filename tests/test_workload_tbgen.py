@@ -5,6 +5,7 @@ import re
 
 import pytest
 
+from setfi.build.netlist import parse_modules
 from setfi.workload import sampling as S
 from setfi.workload import tbgen as T
 from setfi.workload.errors import WorkloadError
@@ -39,10 +40,74 @@ def test_load_taps_rejects_sparse_index(tmp_path):
         T.load_taps(p)
 
 
-def test_verify_xmr_resolves():
-    text = "module top(a, q); wire n5; DFF u_r ( .Q(q_reg_Q) ); wire [3:0] bus; endmodule"
-    taps = ["a", "u_r/q_reg_Q", "bus[2]", "n5", "missing_net", "{n5, a}[0]", "tb.dut.bus[1]"]
-    assert T.verify_xmr_resolves(text, taps) == ["missing_net"]
+# Instance m of `mid` holds instance b of `blk`; m leaves the output z of b unconnected.
+XMR_NETLIST = """
+module blk (a, y, z);
+  input a; output y, z;
+  wire n;
+  INV u0 (.A(a), .ZN(n));
+  INV u1 (.A(n), .ZN(y));
+  INV u2 (.A(n), .ZN(z));
+endmodule
+module mid (a, y);
+  input a; output y;
+  wire [1:0] w;
+  blk b (.a(a), .y(w[0]));
+  INV u3 (.A(w[0]), .ZN(w[1]));
+  assign y = w[1];
+endmodule
+module top (a, y);
+  input a; output y;
+  wire t;
+  INV u4 (.A(a), .ZN(t));
+  mid m (.a(t), .y(y));
+endmodule
+"""
+
+
+def _refused(taps):
+    b, _ = T.resolve_taps(taps, "dut", set())
+    return dict(T.verify_xmr_resolves(b, "dut", parse_modules(XMR_NETLIST), "top"))
+
+
+def test_verify_xmr_resolves_accepts_the_nets_of_every_scope():
+    # ports, wires, bits, nets inside instances, an unconnected port, a resolved
+    # concatenation bit, a literal
+    taps = ["a", "y", "t", "m/a", "m/w[0]", "m/w[1]", "m/b/n", "m/b/z", "m/{w[1], t}[1]", "1'b0"]
+    assert _refused(taps) == {}
+
+
+def test_verify_xmr_resolves_refuses_what_the_simulator_cannot_find():
+    got = _refused(["z", "x/n", "m/c/n", "u4/ZN", "m/b/q", "m/w[2]", "m/{w[2], t}[1]"])
+    assert got == {
+        "z": "no net 'z' in module 'top'",                   # z is a net of m/b only
+        "x/n": "no instance 'x' in module 'top'",
+        "m/c/n": "no instance 'c' in module 'mid'",
+        "u4/ZN": "'u4' in module 'top' is a cell (INV), not a module",
+        "m/b/q": "no net 'q' in module 'blk'",
+        "m/w[2]": "bit 2 is outside w[1:0] in module 'mid'",
+        "m/{w[2], t}[1]": "bit 2 is outside w[1:0] in module 'mid'",
+    }
+    b, _ = T.resolve_taps(["a"], "dut", set())
+    assert T.verify_xmr_resolves(b, "dut", parse_modules(XMR_NETLIST), "core") == [
+        ("a", "no module 'core' in the netlist")]
+
+
+def test_record_refuses_a_missing_tap_before_simulating(tmp_path):
+    from setfi.workload import WorkloadSpec, icarus_preset, record_workload
+    (tmp_path / "net.v").write_text(XMR_NETLIST)
+    spec = WorkloadSpec(netlist=tmp_path / "net.v", top_module="top",
+                        net_index=_net_index(tmp_path, ["a", "t", "m/b/z", "z"]),
+                        testbench=[tmp_path / "tb.sv"], cell_models=[tmp_path / "cells.v"],
+                        output_dir=tmp_path / "out", simulator=icarus_preset())
+    with pytest.raises(WorkloadError) as e:
+        record_workload(spec)
+    assert e.value.kind == "xmr_unresolved"
+    assert e.value.message.startswith("1 of 4 taps name no net of net.v, e.g. z (no net 'z' in "
+                                      "module 'top')")
+    assert json.loads((tmp_path / "out" / "result.json").read_text())["error"]["kind"] == \
+        "xmr_unresolved"
+    assert list((tmp_path / "out" / "sim").iterdir()) == []      # no simulator pass ran
 
 
 def test_resolve_taps_kinds():

@@ -65,11 +65,9 @@ def _abs(p: Path) -> Path:
     return Path(p).expanduser().absolute()
 
 
-def _design_inputs(spec) -> List[str]:
+def _design_inputs(modules: Dict[str, Any], top_module: str) -> List[str]:
     """Input ports of the design's top module, as the testbench drives them."""
-    from ..build.netlist import parse_modules
-    mods = parse_modules(Path(spec.netlist).read_text(errors="replace"))
-    top = mods.get(spec.top_module)
+    top = modules.get(top_module)
     if top is None:
         return []
     return sorted(p for p, d in top.port_dirs.items() if d == "input")
@@ -119,14 +117,17 @@ def record_workload(spec: WorkloadSpec, log: Optional[Callable[[str], None]] = N
         taps, ff_nets = load_taps(spec.net_index, spec.ff_index)
         _log(f"  recording {len(taps)} nets"
              + (f" ({len(ff_nets)} flip-flop D/Q nets)" if ff_nets is not None else ""))
-        missing = verify_xmr_resolves(netlist.read_text(errors="ignore"), taps)
-        if missing:
+        bindings, bind_meta = resolve_taps(taps, spec.tb_dut_inst, ff_nets)
+        from ..build.netlist import parse_modules
+        modules = parse_modules(netlist.read_text(errors="ignore"))
+        bad = verify_xmr_resolves(bindings, spec.tb_dut_inst, modules, spec.top_module)
+        if bad:
             raise WorkloadError(
                 "xmr_unresolved",
-                f"{len(missing)} tap leaf names not found in {netlist.name}; sample: "
-                f"{missing[:10]}. The net_index does not belong to this netlist, or the "
-                f"netlist renamed them.")
-        bindings, bind_meta = resolve_taps(taps, spec.tb_dut_inst, ff_nets)
+                f"{len(bad)} of {len(taps)} taps name no net of {netlist.name}, e.g. "
+                + "; ".join(f"{tap} ({why})" for tap, why in bad[:5])
+                + ". The net_index does not belong to this netlist, or the netlist "
+                  "changed after the build.")
         if bind_meta["n_unresolved_taps"]:
             _log(f"  WARN: {bind_meta['n_unresolved_taps']} net(s) outside flip-flops could not "
                  f"be read and are recorded as 0 (cycles.json n_unreadable_nets).")
@@ -163,7 +164,7 @@ def record_workload(spec: WorkloadSpec, log: Optional[Callable[[str], None]] = N
         # ---- pass 1 ----
         wrapper1 = work / "setfi_tb_wrapper_pass1.sv"
         monitor = input_timing_monitor(spec.tb_dut_inst, clk_net, rst_guard_expr(rst_net, rst_pol),
-                                       _design_inputs(spec))
+                                       _design_inputs(modules, spec.top_module))
         emit_wrapper(wrapper1, tb_top_module=spec.tb_top_module, clk_net=clk_net,
                      rst_net=rst_net, rst_polarity=rst_pol, include_path=None,
                      version=_PKG_VERSION, monitor=monitor)

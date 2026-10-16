@@ -716,3 +716,45 @@ def test_unconnected_port_reference_shapes():
     ports, conn = {"z", "w", "c"}, {"c": "top_net"}
     assert [resolve_net(x, "b", ports, conn, {"w": (1, 0)})
             for x in ("z", "w[1]", "w[1:0]", "c")] == ["b/z", "b/w[1]", "b/w[1:0]", "top_net"]
+
+
+def _build_small(d, text, sdf):
+    d.mkdir()
+    (d / "cells.v").write_text(HIER_CELLS)
+    (d / "net.v").write_text(text)
+    (d / "net.sdf").write_text(sdf)
+    run_build(BuildSpec(netlist=str(d / "net.v"), sdf=str(d / "net.sdf"), top="top",
+                        out_dir=str(d / "out"),
+                        library=LibrarySpec(behavioral_verilog=str(d / "cells.v"))))
+    return d / "out"
+
+
+def _refused_taps(out, text, made_up=()):
+    """The taps of a build, and made-up ones, that the recorder's tap check refuses."""
+    from setfi.workload.tbgen import load_taps, resolve_taps, verify_xmr_resolves
+    taps, ff_nets = load_taps(out / "net_index.json", out / "ff_index.json")
+    bindings, _ = resolve_taps(taps + list(made_up), "dut", ff_nets)
+    return [t for t, _ in verify_xmr_resolves(bindings, "dut", parse_modules(text), "top")]
+
+
+def test_tap_check_accepts_the_nets_of_the_test_designs(tmp_path):
+    (tmp_path / "base").mkdir()
+    run_build(write_case(tmp_path / "base"))
+    assert _refused_taps(tmp_path / "base" / "out", NETLIST.replace("EXTRA", "")) == []
+    for name, text, sdf in (("flat", FLAT, _hier_sdf("")), ("hier", HIER, _hier_sdf("b/")),
+                            ("open_flat", OPEN_FLAT, _open_sdf("")),
+                            ("open_hier", OPEN_HIER, _open_sdf("b/"))):
+        assert _refused_taps(_build_small(tmp_path / name, text, sdf), text) == []
+
+
+def test_tap_check_same_answer_flat_and_hierarchical(tmp_path):
+    """The same design, flat and with a sub-module: every net of the build is accepted
+    and the same made-up nets are refused."""
+    got = {}
+    for name, text, prefix in (("flat", OPEN_FLAT, ""), ("hier", OPEN_HIER, "b/")):
+        out = _build_small(tmp_path / name, text, _open_sdf(prefix))
+        got[name] = _refused_taps(out, text, [prefix + "nope", prefix + "w[2]", "x/n"])
+    assert got["flat"] == ["nope", "w[2]", "x/n"]
+    assert got["hier"] == ["b/nope", "b/w[2]", "x/n"]
+    # the unconnected port z of b by its local name, which exists only inside b
+    assert _refused_taps(tmp_path / "hier" / "out", OPEN_HIER, ["z"]) == ["z"]
