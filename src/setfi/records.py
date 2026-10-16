@@ -8,9 +8,6 @@ The inject stage writes ``<dir>/inject/``:
     records_c<i>_s<j>.npz   the records of block i of consecutive sampled
                         cycles (inject.cycles_per_shard of them) and slice j of
                         the sites (one slice per parallel job)
-    phase_grid_captures.csv   only with inject.phase_grid_steps: one row per
-                        (cycle, site, start_ps, width_ps) that upsets flip-flops,
-                        ``ffs`` = their ids joined with ``|``
 
 One record = one pulse seen at the D pin of one observed FF in one trial.
 A trial is (cycle, site, pulse width); the SET start time is not part of the
@@ -35,7 +32,8 @@ starting at time s (ps from the start of the cycle) iff
     leave[base] - t_exit + 1  <=  s  <=  enter[base] - t_enter - 1
 
 (the pulse overlaps the FF's setup/hold window around the capture edge at T).
-Trials with no record reached no observed FF.
+Trials with no record reached no observed FF.  setfi.analysis.exposure applies
+this rule to every start time, setfi.analysis.patterns to a grid of them.
 """
 from __future__ import annotations
 

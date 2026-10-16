@@ -136,6 +136,27 @@ def test_run_rerun_and_partial_update(tmp_path, capsys):
     assert "note" not in capsys.readouterr().out
 
 
+def test_patterns_stage(tmp_path, capsys):
+    from setfi.analysis.patterns import Patterns
+    from setfi.records import Records
+    from test_patterns import assert_expands_to_the_brute_force_grid
+    cfg = _project(tmp_path)
+    with open(cfg, "a") as f:
+        f.write("[patterns]\nsteps = 10\njobs = 2\n")
+    assert cli.main(["run", "-c", cfg]) == 0
+    assert "[patterns] " in capsys.readouterr().out
+    out = tmp_path / "out"
+    assert sorted(os.listdir(out / "patterns")) == ["patterns.csv", "patterns.npz"]
+    pt = Patterns.load(str(out / "patterns" / "patterns.npz"))
+    assert pt.count > 0 and pt.steps == 10
+    assert_expands_to_the_brute_force_grid(pt, Records.open(str(out / "inject")))
+    print(pt.count, pt.cycle(0), pt.multiplicity(0), pt.ffs(0, names=True), pt.sources(0)[:3])  # README
+    assert cli.main(["run", "-c", cfg]) == 0
+    assert "[patterns] up to date" in capsys.readouterr().out
+    assert cli.main(["status", "-c", cfg]) == 0
+    assert "patterns up to date" in capsys.readouterr().out
+
+
 def test_several_width_models(tmp_path):
     cfg = _project(tmp_path)
     with open(cfg, "a") as f:

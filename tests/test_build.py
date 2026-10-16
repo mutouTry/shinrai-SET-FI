@@ -412,7 +412,7 @@ def test_intermediates_and_stale_files(tmp_path):
     inter = os.path.join(spec.out_dir, "intermediate")
     assert {"cone_db.jsonl", "superedges.json", "net_entry.json", "inst_index.json",
             "arc_delays.json"} <= set(os.listdir(inter))
-    # Rebuilding from an SDF without INTERCONNECT must not leave the old interconnect behind.
+    # Rebuilding from an SDF without INTERCONNECT removes interconnect.json.
     spec2 = write_case(tmp_path, sdf=make_sdf(BASE_CELLS, interconnect=""))
     man = run_build(spec2)
     assert not os.path.exists(os.path.join(spec.out_dir, "interconnect.json"))

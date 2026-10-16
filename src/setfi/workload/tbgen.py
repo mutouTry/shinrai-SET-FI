@@ -297,8 +297,8 @@ module {WRAPPER_MODULE};
     end
 
     // ---- [SETFI-CYC] markers ----
-    // first marker: emitted ONCE at the first cycle observed in functional
-    // mode (rst deasserted). Robust under repeated reset assertions.
+    // first marker: emitted once, at the first cycle in functional mode
+    // (reset deasserted), even if reset is asserted again later.
     reg setfi_first_seen;
     initial setfi_first_seen = 1'b0;
     always @(posedge tb.{clk_net}) begin

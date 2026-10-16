@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -86,7 +87,7 @@ class Substrate:
     """All static inputs of a campaign."""
     net_to_idx: Dict[str, int]
     idx_to_net: Dict[int, str]
-    skeleton: Dict[str, Dict[str, Any]]
+    skeleton: "Mapping[str, Dict[str, Any]]"     # a SiteCones, or the dict of load_skeleton
     edges: Dict[int, Edge]
     inst_pins: Dict[str, Dict[str, str]]
     cell_arcs: Dict[str, Any]
@@ -136,6 +137,88 @@ def load_skeleton(path: str, idx_to_net: Dict[int, str]) -> Dict[str, Dict[str, 
             out[src] = {"src_net": src, "cone_topo_nets": topo, "cone_adj": adj,
                         "reachable_dnets": dnets, "has_reconv": obj.get("has_reconv")}
     return out
+
+
+class SiteCones(Mapping):
+    """site_cones.jsonl held as integer arrays (CSR over the rows of the file).
+
+    Behaves like the dict that ``load_skeleton`` returns: site name -> {"src_net",
+    "cone_topo_nets", "cone_adj", "reachable_dnets", "has_reconv"}; looking a site
+    up builds that dict.  Nets are numbered by ``nid`` / ``names`` (the names of
+    net_index.json in index order); ``arrays`` holds, per row, ``src`` and the
+    CSR pairs topo_ptr/topo, adj_ptr/adj_u/adj_eptr/eids, dn_ptr/dn, and
+    has_reconv (-1 = null)."""
+
+    def __init__(self, names: List[str], nid: Dict[str, int], arrays: Dict[str, np.ndarray]):
+        self.names = names
+        self.nid = nid
+        self.arrays = arrays
+        self._row: Dict[str, int] = {}
+        for r, s in enumerate(arrays["src"].tolist()):     # a repeated site: the last row wins
+            self._row[names[s]] = r
+
+    def row(self, site: str) -> int:
+        return self._row[site]
+
+    def __getitem__(self, site: str) -> Dict[str, Any]:
+        r = self._row[site]
+        a, names = self.arrays, self.names
+        tp, ap, ep, dp = a["topo_ptr"], a["adj_ptr"], a["adj_eptr"], a["dn_ptr"]
+        eids = a["eids"]
+        adj_u = a["adj_u"][ap[r]:ap[r + 1]].tolist()
+        adj = [[names[u], eids[ep[k]:ep[k + 1]].tolist()] for u, k in zip(adj_u, range(ap[r], ap[r + 1]))]
+        rc = int(a["has_reconv"][r])
+        return {"src_net": names[int(a["src"][r])],
+                "cone_topo_nets": [names[i] for i in a["topo"][tp[r]:tp[r + 1]].tolist()],
+                "cone_adj": adj,
+                "reachable_dnets": [names[i] for i in a["dn"][dp[r]:dp[r + 1]].tolist()],
+                "has_reconv": None if rc < 0 else bool(rc)}
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._row)
+
+    def __len__(self) -> int:
+        return len(self._row)
+
+    def __contains__(self, site: object) -> bool:
+        return site in self._row
+
+
+def load_site_cones(path: str, idx_to_net: Dict[int, str], n_threads: int = 1) -> Optional[SiteCones]:
+    """site_cones.jsonl in the index form the build writes, read in C++.
+
+    Returns None whenever ``load_skeleton`` has to decide (the name form, an
+    unknown net index, a file that cannot be read, anything else the C++ reader
+    does not handle); that keeps its behaviour, including its errors, unchanged."""
+    from .. import _engine
+    if not idx_to_net or not os.path.isfile(path):
+        return None
+    keys = sorted(idx_to_net)
+    if keys[0] < 0 or keys[-1] > 4 * len(keys) + 1_000_000:
+        return None
+    arrays = _engine.parse_site_cones(path, max(1, int(n_threads)))
+    if arrays is None:
+        return None
+    names: List[str] = []
+    nid: Dict[str, int] = {}
+    nid_of_idx = np.full(keys[-1] + 1, -1, dtype=np.int32)
+    for i in keys:
+        n = idx_to_net[i]
+        j = nid.get(n)
+        if j is None:
+            j = nid[n] = len(names)
+            names.append(n)
+        nid_of_idx[i] = j
+    identity = len(names) == len(keys) == keys[-1] + 1
+    for k in ("src", "topo", "adj_u", "dn"):
+        a = arrays[k]
+        if a.size and (int(a.min()) < 0 or int(a.max()) >= nid_of_idx.size):
+            return None
+        m = a.astype(np.int32, copy=False) if identity else nid_of_idx[a]
+        if not identity and m.size and int(m.min()) < 0:
+            return None
+        arrays[k] = m
+    return SiteCones(names, nid, arrays)
 
 
 def load_edges(path: str) -> Dict[int, Edge]:
@@ -327,8 +410,14 @@ def load_wire_lut(stage_dir: str, mode: str) -> Dict[Tuple[str, str], Tuple[int,
 
 
 def load_substrate(stage_dir: str, *, clock_pins: List[str], interconnect: str = "ignore",
-                   timeprecision_ps: int = 1, allow_missing_timing_checks: bool = False) -> Substrate:
-    """Load the build directory and resolve every FF's setup/hold values."""
+                   timeprecision_ps: int = 1, allow_missing_timing_checks: bool = False,
+                   n_threads: Optional[int] = None) -> Substrate:
+    """Load the build directory and resolve every FF's setup/hold values.
+
+    With ``n_threads``, site_cones.jsonl is read in C++ on that many threads
+    whenever that reader can (``load_site_cones``), and ``skeleton`` is then a
+    read-only ``SiteCones``; its content is the same as with the Python reader,
+    the default."""
     p = lambda name: os.path.join(stage_dir, name)  # noqa: E731
     for name in ("net_index.json", "site_cones.jsonl", "edges.json", "pin_to_net.json",
                  "ff_index.json", "cell_arcs.json", "timing_checks.json",
@@ -337,7 +426,9 @@ def load_substrate(stage_dir: str, *, clock_pins: List[str], interconnect: str =
             raise SubstrateError(f"build output {p(name)} is missing")
 
     net_to_idx, idx_to_net = load_net_index(p("net_index.json"))
-    skeleton = load_skeleton(p("site_cones.jsonl"), idx_to_net)
+    skeleton = None if n_threads is None else load_site_cones(p("site_cones.jsonl"), idx_to_net, n_threads)
+    if skeleton is None:
+        skeleton = load_skeleton(p("site_cones.jsonl"), idx_to_net)
     edges = load_edges(p("edges.json"))
     inst_pins = load_pin_to_net(p("pin_to_net.json"))
     cell_arcs = _load_json(p("cell_arcs.json"))

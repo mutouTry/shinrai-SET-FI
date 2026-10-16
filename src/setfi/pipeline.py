@@ -25,11 +25,10 @@ def campaign_spec_from_config(cfg, paths: Dict[str, str]):
         out_dir=paths["inject"], clock_period_ps=T,
         pulse_widths_ps=sorted(set(int(w) for w in cfg["fault_model"]["pulse_widths_ps"])),
         sim_horizon_ps=horizon, delay_choice=prop["delay_choice"],
-        electrical_masking=prop["electrical_masking"], em_margin_ps=prop["em_margin_ps"],
         interconnect=prop["interconnect"], clock_pins=cfg["library"]["timing_check_clock_pins"],
         allow_missing_timing_checks=cfg["observe"]["allow_missing_timing_checks"],
         sites=cfg["fault_model"]["sites"] or None, cycles_per_shard=inj["cycles_per_shard"],
-        jobs=inj["jobs"], phase_grid_steps=inj["phase_grid_steps"] or None)
+        jobs=inj["jobs"])
 
 
 def state_paths(record_dir: str):

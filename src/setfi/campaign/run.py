@@ -7,8 +7,12 @@ is written as a record (see ``setfi.records``).  The SET start time within the
 cycle is not simulated separately: it only shifts the pulse, and the capture
 condition is applied analytically by the analysis step.
 
-Optionally the campaign also writes the classic discrete view: for a grid of
-start times, which FFs capture (``phase_grid_captures.csv``).
+The trials run in C++ (``_engine.run_block``, one call per block of cycles,
+``jobs`` threads) on cones compiled in C++ (``fastpath.compile_sites``), after
+site_cones.jsonl has been read in C++.  The Python code that does the same (the
+site_cones.jsonl reader, ``cone.build_cone`` and the ``_Worker`` loop on ``jobs``
+processes) is kept as the reference engine, against which the tests check the
+C++ code: set SETFI_REFERENCE_ENGINE=1 to use it.  Both write the same files.
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import multiprocessing as mp
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from typing import Dict, List, Optional, Tuple
@@ -24,15 +29,17 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .. import _engine
-from ..records import FORMAT, INF_PS, write_shard
+from ..records import COLUMNS, FORMAT, INF_PS, write_shard
 from .cone import (ConeStats, CapturePlan, PackedCone, build_capture_plan, build_cone,
                    pack_cone, thresholds)
+from .fastpath import compile_sites
 from .state import read_cycle_bits
-from .substrate import Substrate, load_substrate
+from .substrate import SiteCones, Substrate, load_substrate
 
-STAT_KEYS = ("applied_events", "canceled_late", "canceled_race", "canceled_replace",
-             "canceled_back_to_current", "kept_same_target", "coalesced_nets", "coalesced_events",
-             "dropped_arc_no_delay", "dropped_no_candidate_arc")
+STAT_KEYS = ("applied_events", "canceled_replace", "canceled_back_to_current", "kept_same_target",
+             "coalesced_nets", "coalesced_events", "dropped_arc_no_delay", "dropped_no_candidate_arc")
+# columns of run_block's site_stats
+SITE_STATS = ("n_sims",) + STAT_KEYS + ("max_heap", "n_sims_reaching_d", "n_sims_with_records")
 
 
 @dataclass
@@ -45,9 +52,7 @@ class CampaignSpec:
     pulse_widths_ps: List[int]
     capture_edge_ps: Optional[int] = None     # default: clock period
     sim_horizon_ps: Optional[int] = None      # default: 1.25 x capture edge
-    delay_choice: str = "max"                 # "max" | "min" over inputs that explain a change
-    electrical_masking: bool = True
-    em_margin_ps: int = 0
+    delay_choice: str = "max"                 # "max" | "min" when no changed input has an active path
     coalesce_window_ps: int = 0
     interconnect: str = "ignore"              # "ignore" | "transport"
     clock_pins: List[str] = field(default_factory=lambda: ["CP", "CK", "CLK"])
@@ -55,7 +60,6 @@ class CampaignSpec:
     sites: Optional[List[str]] = None         # subset of injection sites (default: all)
     cycles_per_shard: int = 10
     jobs: int = 1
-    phase_grid_steps: Optional[int] = None    # write phase_grid_captures.csv on k*T/steps
     timeprecision_ps: int = 1
 
     def resolved(self) -> "CampaignSpec":
@@ -67,13 +71,12 @@ class CampaignSpec:
         return s
 
 
-def phase_grid(period_ps: int, steps: int) -> np.ndarray:
-    """k * T / steps for k = 0..steps, rounded half up to integer ps."""
-    out = []
-    for k in range(steps + 1):
-        v = Fraction(k * period_ps, steps)
-        out.append(int(v.numerator * 2 + v.denominator) // (2 * v.denominator))
-    return np.asarray(out, dtype=np.int64)
+def engine_options(spec: CampaignSpec) -> Dict[str, object]:
+    """The propagation flags of a (resolved) spec, as run_block takes them.
+
+    simulate_pulses takes the same flags as positional arguments, in this order."""
+    return {"sim_end_ps": int(spec.sim_horizon_ps), "eps_ps": int(spec.coalesce_window_ps),
+            "delay_policy_is_max": spec.delay_choice == "max"}
 
 
 @dataclass
@@ -89,7 +92,8 @@ class CompiledSite:
 
 
 class _Worker:
-    """One process: a fixed slice of the injection sites, all cycles."""
+    """The reference engine's trial loop.  One process: a fixed slice of the
+    injection sites, all cycles."""
 
     def __init__(self, spec: CampaignSpec, sub: Substrate, sites: List[str], site_index: Dict[str, int]):
         self.spec = spec
@@ -99,15 +103,13 @@ class _Worker:
         self.cone_stats = ConeStats()
         self.cones: Dict[str, CompiledSite] = {}
         self.pws = np.asarray(spec.pulse_widths_ps, dtype=np.int64)
-        self.starts = (phase_grid(spec.capture_edge_ps, spec.phase_grid_steps)
-                       if spec.phase_grid_steps else None)
 
     def cone(self, site: str) -> CompiledSite:
         c = self.cones.get(site)
         if c is None:
             sub = self.sub
             cone = build_cone(sub, site, self.cone_stats)
-            plan = build_capture_plan(sub, cone, self.spec.capture_edge_ps, self.cone_stats)
+            plan = build_capture_plan(sub, cone, self.cone_stats)
             gidx = np.asarray([sub.net_to_idx.get(n, -1) for n in cone.i2net], dtype=np.int32)
             valid = gidx >= 0
             settle = None
@@ -126,7 +128,6 @@ class _Worker:
         spec = self.spec
         sub = self.sub
         rec = {k: [] for k in ("cycle", "site", "width_ps", "ff", "base", "t_enter", "t_exit")}
-        grid_lines: List[str] = []
         stats = {k: 0 for k in STAT_KEYS}
         stats.update(n_sims=0, n_sims_reaching_d=0, n_sims_with_records=0, max_heap=0)
         n_nets = len(sub.idx_to_net)
@@ -153,11 +154,8 @@ class _Worker:
                 results = _engine.simulate_pulses(
                     cs.packed, sub.delaytab, net_val, int(cs.src_i), v0, v0 ^ 1, self.pws,
                     int(spec.sim_horizon_ps), int(spec.coalesce_window_ps),
-                    bool(spec.electrical_masking), int(spec.em_margin_ps),
                     spec.delay_choice == "max")
                 sidx = self.site_idx[site]
-                per_start: Optional[List[List[str]]] = (
-                    [[] for _ in range(len(self.starts))] if self.starts is not None else None)
                 for pw, (ev_ptr, ev_t, ev_v, st) in zip(self.pws.tolist(), results):
                     stats["n_sims"] += 1
                     for k in STAT_KEYS:
@@ -186,25 +184,10 @@ class _Worker:
                             rec["base"].append(dp_base[dpi][rep])
                             rec["t_enter"].append(t_a[rep])
                             rec["t_exit"].append(t_b[rep])
-                    if per_start is not None:
-                        mw = _engine.capture_masks(
-                            self.starts, plan.thr_enter, plan.thr_leave, ev_ptr, ev_t, ev_v,
-                            plan.dp_rec_slot, dp_base, plan.dp_ptr, plan.dp_idx, plan.word_index,
-                            plan.word_mask, plan.n_words, INF_PS)
-                        nz = np.nonzero(np.any(mw != 0, axis=1))[0]
-                        for si in nz.tolist():
-                            ids = _decode(mw[si], plan.ffids)
-                            per_start[si].append(f"{cyc},{site},{int(self.starts[si])},{pw},{ids}\n")
-                if per_start is not None:
-                    for lines in per_start:
-                        grid_lines.extend(lines)
 
         cols = {k: (np.concatenate(v) if v else np.zeros(0)) for k, v in rec.items()}
         shard = write_shard(os.path.join(spec.out_dir, f"records_{shard_id}.npz"), cols)
         shard.update(cycles=[int(c) for c in cycles])
-        if self.starts is not None:
-            with open(os.path.join(spec.out_dir, f"grid_{shard_id}.csv.part"), "w") as f:
-                f.write("".join(grid_lines))
         stats["unconnected_side_pins"] = self.cone_stats.unconnected_side_pins
         return {"shard": shard, "stats": stats}
 
@@ -220,18 +203,62 @@ class _Worker:
         return out
 
 
-def _decode(words: np.ndarray, ffids: np.ndarray) -> str:
-    out = []
-    n = int(ffids.shape[0])
-    for wi in range(int(words.shape[0])):
-        w = int(words[wi])
-        while w:
-            lsb = w & -w
-            b = wi * 64 + lsb.bit_length() - 1
-            if b < n:
-                out.append(str(int(ffids[b])))
-            w ^= lsb
-    return "|".join(out)
+def _write_slice(spec: CampaignSpec, b: int, chunk: int, cycles: List[int], out: Dict, lo: int, hi: int,
+                 n_sites: int, unconnected: np.ndarray) -> Dict:
+    """The record file of block b, site slice chunk = sites[lo:hi]."""
+    sid = f"c{b:03d}_s{chunk:03d}"
+    off = out["rec_off"]
+    spans = [(int(off[k * n_sites + lo]), int(off[k * n_sites + hi])) for k in range(len(cycles))]
+    cols = {k: np.concatenate([out[k][a:z] for a, z in spans]) if spans else out[k][:0] for k in COLUMNS}
+    shard = write_shard(os.path.join(spec.out_dir, f"records_{sid}.npz"), cols)
+    shard.update(cycles=[int(c) for c in cycles])
+    S = out["site_stats"][lo:hi]
+    col = {k: S[:, i] for i, k in enumerate(SITE_STATS)}
+    stats = {k: int(col[k].sum()) for k in STAT_KEYS}
+    stats.update(n_sims=int(col["n_sims"].sum()), n_sims_reaching_d=int(col["n_sims_reaching_d"].sum()),
+                 n_sims_with_records=int(col["n_sims_with_records"].sum()),
+                 max_heap=int(col["max_heap"].max()) if hi > lo else 0)
+    stats["unconnected_side_pins"] = int(unconnected[lo:hi].sum())
+    return {"shard": shard, "stats": stats, "site_slice": chunk}
+
+
+def _run_fast(spec: CampaignSpec, sub: Substrate, sites: List[str], site_index: Dict[str, int],
+              blocks, bounds: List[int], log, timing: Dict[str, float]) -> List[Dict]:
+    """All blocks with run_block; results in the order of the reference engine."""
+    n_chunks = len(bounds) - 1
+    if not blocks:               # no cycles: the reference engine never compiles a cone either
+        return []
+    pws = np.asarray(spec.pulse_widths_ps, dtype=np.int64)
+    t = time.time()
+    cones = compile_sites(sub, sites, n_threads=n_chunks)
+    timing["compile"] = time.time() - t
+    site_ids = np.asarray([site_index[s] for s in sites], dtype=np.int32)
+    unconnected = np.asarray([c.unconnected_side_pins for c in cones], dtype=np.int64)
+    opts = engine_options(spec)
+    n_nets = len(sub.idx_to_net)
+    by_chunk: List[List[Dict]] = [[] for _ in range(n_chunks)]
+    with ThreadPoolExecutor(max_workers=n_chunks) as pool:
+        for b, cycles in blocks:
+            t = time.time()
+            bits = np.stack([read_cycle_bits(spec.state_dir, c, n_nets) for c in cycles])
+            out = _engine.run_block(cones, bits, np.asarray(cycles, dtype=np.int64), site_ids, pws,
+                                    sub.delaytab, opts, INF_PS, n_chunks)
+            del bits
+            t2 = time.time()
+            timing["trials"] = timing.get("trials", 0.0) + (t2 - t)
+            futures = [pool.submit(_write_slice, spec, b, ch, cycles, out, bounds[ch], bounds[ch + 1],
+                                   len(sites), unconnected) for ch in range(n_chunks)]
+            for ch, fu in enumerate(futures):
+                r = fu.result()
+                by_chunk[ch].append(r)
+                log(f"[inject] {r['shard']['file']}: {r['shard']['n_records']:,} records")
+            del out
+            timing["write"] = timing.get("write", 0.0) + (time.time() - t2)
+    return [r for rs in by_chunk for r in rs]
+
+
+def _reference_engine() -> bool:
+    return os.environ.get("SETFI_REFERENCE_ENGINE", "") not in ("", "0")
 
 
 _G: Dict[str, object] = {}
@@ -247,15 +274,25 @@ def check_sites(sites: List[str], stage_dir: str) -> None:
     """Refuse site names that are not injection sites, before anything is deleted."""
     if not sites:
         return
-    import difflib
-    from .substrate import SubstrateError, load_net_index
+    from .substrate import load_net_index, load_site_cones
     net_to_idx, idx_to_net = load_net_index(os.path.join(stage_dir, "net_index.json"))
-    site_idx = set()
-    with open(os.path.join(stage_dir, "site_cones.jsonl"), "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                site_idx.add(int(json.loads(line)["src_net_idx"]))
-    names = {idx_to_net[i] for i in site_idx}
+    fast = None if _reference_engine() else load_site_cones(os.path.join(stage_dir, "site_cones.jsonl"),
+                                                            idx_to_net)
+    if fast is not None:
+        names = set(fast)
+    else:
+        site_idx = set()
+        with open(os.path.join(stage_dir, "site_cones.jsonl"), "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    site_idx.add(int(json.loads(line)["src_net_idx"]))
+        names = {idx_to_net[i] for i in site_idx}
+    _refuse_unknown_sites(sites, names)
+
+
+def _refuse_unknown_sites(sites: List[str], names) -> None:
+    import difflib
+    from .substrate import SubstrateError
     bad = [s for s in sites if s not in names]
     if bad:
         hint = difflib.get_close_matches(bad[0], sorted(names), n=3)
@@ -268,20 +305,26 @@ def check_sites(sites: List[str], stage_dir: str) -> None:
 
 def run_campaign(spec: CampaignSpec, log=print) -> Dict:
     spec = spec.resolved()
+    reference = _reference_engine()
     t0 = time.time()
     sub = load_substrate(spec.stage_dir, clock_pins=spec.clock_pins, interconnect=spec.interconnect,
                          timeprecision_ps=spec.timeprecision_ps,
-                         allow_missing_timing_checks=spec.allow_missing_timing_checks)
+                         allow_missing_timing_checks=spec.allow_missing_timing_checks,
+                         n_threads=None if reference else max(1, int(spec.jobs)))
+    timing = {"load": time.time() - t0}
     all_sites = sorted(sub.skeleton)
     if spec.sites:
-        check_sites(list(spec.sites), spec.stage_dir)
+        if isinstance(sub.skeleton, SiteCones):    # the same names check_sites reads
+            _refuse_unknown_sites(list(spec.sites), set(sub.skeleton))
+        else:
+            check_sites(list(spec.sites), spec.stage_dir)
         sites = sorted(set(spec.sites))
     else:
         sites = all_sites
     site_index = {s: i for i, s in enumerate(sites)}
     os.makedirs(spec.out_dir, exist_ok=True)
     for f in os.listdir(spec.out_dir):          # a previous campaign's files must not survive
-        if f.startswith(("records_", "grid_")) or f in ("index.json", "phase_grid_captures.csv"):
+        if f.startswith("records_") or f == "index.json":
             os.remove(os.path.join(spec.out_dir, f))
     log(f"[inject] {len(spec.cycles)} cycles x {len(sites)} sites x {len(spec.pulse_widths_ps)} widths "
         f"= {len(spec.cycles) * len(sites) * len(spec.pulse_widths_ps):,} trials; "
@@ -289,13 +332,17 @@ def run_campaign(spec: CampaignSpec, log=print) -> Dict:
 
     blocks = [(b, spec.cycles[i:i + spec.cycles_per_shard])
               for b, i in enumerate(range(0, len(spec.cycles), spec.cycles_per_shard))]
-    # Each process owns a fixed, contiguous slice of the sites for every cycle, so it
-    # builds (and holds) only the cones of its own sites.
+    # The sites are cut into n_chunks contiguous slices, one record file per (block,
+    # slice).  The C++ engine shares the sites of a block out over n_chunks threads;
+    # the reference engine runs one process per slice, which builds (and holds) only
+    # the cones of its own sites.
     n_chunks = max(1, min(int(spec.jobs), len(sites)))
     bounds = [round(i * len(sites) / n_chunks) for i in range(n_chunks + 1)]
     slices = [sites[bounds[i]:bounds[i + 1]] for i in range(n_chunks)]
     results: List[Dict] = []
-    if n_chunks > 1:
+    if not reference:
+        results = _run_fast(spec, sub, sites, site_index, blocks, bounds, log, timing)
+    elif n_chunks > 1:
         _G.update(spec=spec, sub=sub, slices=slices, site_index=site_index, blocks=blocks)
         ctx = mp.get_context("fork")
         with ctx.Pool(processes=n_chunks) as pool:
@@ -314,18 +361,6 @@ def run_campaign(spec: CampaignSpec, log=print) -> Dict:
     counts = {"trials": stats.get("n_sims", 0),
               "trials_reaching_an_observed_ff": stats.get("n_sims_with_records", 0),
               "records": sum(r["shard"]["n_records"] for r in results)}
-
-    if spec.phase_grid_steps:
-        grid_path = os.path.join(spec.out_dir, "phase_grid_captures.csv")
-        with open(grid_path, "w") as out:
-            out.write("cycle,site,start_ps,width_ps,ffs\n")
-            for r in results:
-                part = os.path.join(spec.out_dir, "grid_" + r["shard"]["file"][len("records_"):-len(".npz")]
-                                    + ".csv.part")
-                with open(part) as f:
-                    for chunk in iter(lambda: f.read(1 << 22), ""):
-                        out.write(chunk)
-                os.remove(part)
 
     ffs = []
     for ffid in sorted(sub.ffs):
@@ -347,8 +382,7 @@ def run_campaign(spec: CampaignSpec, log=print) -> Dict:
         "ffs": ffs,
         "shards": [r["shard"] for r in results],
         "propagation": {"horizon_ps": spec.sim_horizon_ps, "delay_choice": spec.delay_choice,
-                        "electrical_masking": spec.electrical_masking,
-                        "em_margin_ps": spec.em_margin_ps, "interconnect": spec.interconnect},
+                        "interconnect": spec.interconnect},
         "counts": counts,
         "elapsed_s": round(time.time() - t0, 3),
     }
@@ -356,6 +390,8 @@ def run_campaign(spec: CampaignSpec, log=print) -> Dict:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(index, f, indent=1)
     os.replace(tmp, os.path.join(spec.out_dir, "index.json"))
+    if timing.get("compile") is not None:
+        log("[inject] time: " + ", ".join(f"{k} {v:.1f}s" for k, v in timing.items()))
     log(f"[inject] done in {index['elapsed_s']}s: {counts['records']:,} records -> {spec.out_dir}")
     return index
 

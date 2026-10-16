@@ -52,11 +52,12 @@ SECTIONS = {
     "observe": "Which flip-flops count as observation points.",
     "propagation": "How a pulse propagates through the gates.",
     "inject": "How the injection campaign runs.",
+    "patterns": "Which flip-flops SETs upset together, and where from.",
     "analyze": "How upset probabilities are computed.",
     "build": "Advanced options of the netlist and SDF reader.",
 }
 
-STAGES = ("build", "record", "inject", "analyze")
+STAGES = ("build", "record", "inject", "patterns", "analyze")
 
 # The configuration each stage reads: whole sections, or (section, key) pairs.  A
 # stage is re-run when one of these values (for files: their content) changes.
@@ -65,16 +66,16 @@ STAGE_KEYS = {
               ("design", "top"), ("fault_model", "inject_ff_d_nets"),
               ("propagation", "sdf_rail")],
     "record": ["workload", "simulator", ("design", "netlist"), ("design", "top")],
-    "inject": ["inject", ("propagation", "delay_choice"), ("propagation", "electrical_masking"),
-               ("propagation", "em_margin_ps"), ("propagation", "interconnect"),
+    "inject": ["inject", ("propagation", "delay_choice"), ("propagation", "interconnect"),
                ("propagation", "horizon_factor"), ("design", "clock_period_ns"),
                ("fault_model", "pulse_widths_ps"), ("fault_model", "sites"),
                ("library", "timing_check_clock_pins"),
                ("observe", "allow_missing_timing_checks")],
+    "patterns": ["patterns"],
     "analyze": ["analyze"],
 }
 # Keys that change how a stage runs, not its result.
-EXECUTION_ONLY = {("inject", "jobs"), ("inject", "cycles_per_shard"),
+EXECUTION_ONLY = {("inject", "jobs"), ("inject", "cycles_per_shard"), ("patterns", "jobs"),
                   ("workload", "compile_timeout_s"), ("workload", "sim_timeout_s")}
 
 
@@ -235,13 +236,11 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
     },
     "propagation": {
         "delay_choice": _k("choice:max|min", "max",
-                           "When several inputs of a gate change at the same instant and each "
-                           "explains the output change, use the largest or smallest arc delay."),
-        "electrical_masking": _k("bool", True,
-                                 "Inertial filtering: an output transition is cancelled when its "
-                                 "cause reverts before the gate delay has elapsed."),
-        "em_margin_ps": _k("int", 0, "Added to the gate delay when deciding whether a pulse is "
-                                     "filtered (ps); positive filters more."),
+                           "Delay of a gate output change when several inputs change at the same "
+                           "instant and none of them has an active SDF path (each arc has COND "
+                           "entries and none holds): the largest or the smallest default delay "
+                           "of the inputs that explain the change. With an active path, the "
+                           "smallest active delay is used (docs/MODEL.md)."),
         "sdf_rail": _k("choice:late|early", "late",
                        "Which value of SDF (min:typ:max) triples to use: late = max, early = min."),
         "interconnect": _k("choice:ignore|transport", "ignore",
@@ -263,12 +262,17 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
                                           "(trial_exposure.npz)."),
     },
     "inject": {
-        "jobs": _k("int", 1, "Parallel processes (does not change the results)."),
+        "jobs": _k("int", 1, "Parallel threads (does not change the results)."),
         "cycles_per_shard": _k("int", 10, "Cycles per record file; bounds memory (does not "
                                           "change the results)."),
-        "phase_grid_steps": _k("int", 0,
-                               "If > 0, also write inject/phase_grid_captures.csv: for start "
-                               "times k*T/steps (k = 0..steps), the flip-flops that capture."),
+    },
+    "patterns": {
+        "steps": _k("int", 0,
+                    "If > 0, `setfi run` also writes patterns/: for SET start times k*T/steps "
+                    "(k = 0..steps), the sets of flip-flops upset together, each with the "
+                    "trials and start times that give it (`setfi patterns` runs this stage "
+                    "alone)."),
+        "jobs": _k("int", 1, "Parallel threads (does not change the results)."),
     },
     "observe": {
         "data_pins": _k("strs", [], "Observe only flip-flops whose data pin has one of these "
@@ -299,7 +303,7 @@ EXTRA_SECTIONS: Dict[str, Dict[str, Key]] = {}
 
 # Section order of the template: what every user sets first, advanced knobs last.
 ORDER = ["design", "output", "library", "workload", "simulator", "fault_model", "observe",
-         "propagation", "inject", "analyze", "build"]
+         "propagation", "inject", "patterns", "analyze", "build"]
 
 
 def schema() -> Dict[str, Dict[str, Key]]:
@@ -497,7 +501,8 @@ def validate(cfg: Dict[str, Dict[str, Any]], check_files: bool = True,
         raise ConfigError(f"[design] clock_period_ns = {cfg['design']['clock_period_ns']!r}: "
                           f"must be a whole number of ps, at least 0.001 ns")
     for sec, key, lo in (("workload", "n_cycles", 1), ("inject", "jobs", 1),
-                         ("inject", "cycles_per_shard", 1), ("inject", "phase_grid_steps", 0),
+                         ("inject", "cycles_per_shard", 1),
+                         ("patterns", "steps", 0), ("patterns", "jobs", 1),
                          ("workload", "padding_cycles", 0), ("workload", "warmup_cycles", 0),
                          ("workload", "reserve_factor", 0)):
         if cfg[sec][key] < lo:

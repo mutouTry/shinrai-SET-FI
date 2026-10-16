@@ -74,10 +74,10 @@ def _apply_substitutions(tb_text: str, subs: List[dict]):
 # Opt-in auto-derivation of hier substitutions.
 #
 # When DC's `compile_ultra` flattens the design (`syn_flatten=true`), TB
-# cross-module references like ``dut.<inner>.<sig>[idx]`` no longer resolve
-# — DC has rewritten them into top-scope flat wires (commonly
-# ``<inner>_<sig>``). Authoring the substitution rules by hand is
-# labor-intensive and error-prone (e.g. the MSB-first `(N-1-(\1))` flip).
+# cross-module references like ``dut.<inner>.<sig>[idx]`` no longer resolve:
+# DC has turned them into top-level wires, usually ``<inner>_<sig>``.
+# Writing the substitution rules by hand is tedious and easy to get wrong
+# (e.g. the MSB-first `(N-1-(\1))` index flip).
 #
 # This helper scans the TB for ``dut.<inner>.<sig>`` (and indexed
 # ``dut.<inner>.<sig>[idx]``) references, then for each such reference
@@ -98,11 +98,11 @@ def _apply_substitutions(tb_text: str, subs: List[dict]):
 
 # XMR shape: ``<dut>.<inner_1>.<inner_2>...<inner_N>.<sig>[<idx>?]`` with at
 # least two dotted tokens after ``<dut>`` (i.e. one or more intermediate
-# instance segments + the leaf signal). The ``{2,}`` minimum preserves the
-# 0.1.x assumption that 2-token refs like ``dut.<sig>`` are not in scope for
-# auto-derive (the resolver only fires for hierarchical peeks). Anything
-# deeper — ``dut.u_dut.u_rf.mem`` for a netlist wrapped in an extra layer, etc. —
-# is matched greedily and split by the resolver into (inner_chain, sig).
+# instance segments + the leaf signal). The ``{2,}`` minimum leaves
+# ``dut.<sig>`` alone: only references into sub-instances are rewritten.
+# Deeper references, such as ``dut.u_dut.u_rf.mem`` for a netlist wrapped in
+# an extra layer, are matched whole and split by the resolver into
+# (inner_chain, sig).
 _TB_XMR_RE = re.compile(
     r"\b(?P<dut>[A-Za-z_][A-Za-z0-9_$]*)"
     r"(?P<path>(?:\.[A-Za-z_][A-Za-z0-9_$]*){2,})"
@@ -196,10 +196,9 @@ def _grep_inner_module_for_inst(
     rtl_dut_files for ``<MOD>\\s+(#( ... ))?\\s+<inner_inst>\\s*\\(``.
     Returns the module name or None if ambiguous / not found.
 
-    Uses a manual paren-balanced skip for the optional ``#( ... )`` parameter
-    block so that ``regbank #(.ADDR_W(REG_AW), .DATA_W(DATA_W)) u_rb (`` —
-    which contains nested parens — is matched (the v0.1 flat regex with
-    ``[^)]*`` couldn't span those).
+    The optional ``#( ... )`` parameter block is skipped by counting
+    parentheses, so that ``regbank #(.ADDR_W(REG_AW), .DATA_W(DATA_W)) u_rb (``,
+    with its nested parentheses, is matched; a ``[^)]*`` regex cannot do that.
     """
     KEYWORDS = {"if", "else", "for", "case", "begin", "end",
                  "module", "endmodule", "always", "always_ff", "always_comb",
@@ -301,8 +300,7 @@ def _grep_module_submod_instances(mapped_text: str, module_name: str
     """Return ``{<inner_inst_name>: <submodule_module_name>}`` for every
     sub-module instance found inside the named module body of ``mapped_text``.
 
-    Generic over the named module — the top-module variant just delegates
-    here. Used by the multi-level XMR chain walker so that an XMR like
+    Works for any named module; the top-module variant calls it. Used by the multi-level XMR chain walker so that an XMR like
     ``dut.u_dut.u_rf.mem`` can be resolved by walking ``u_dut`` (in the
     wrapper top), then ``u_rf`` (in the submod ``u_dut`` instantiates), and
     finally looking up ``mem`` as a signal in the innermost submod body.
@@ -400,18 +398,18 @@ def _auto_derive_hier_substitutions(
 ) -> tuple[list[dict], list[dict]]:
     """Returns (rules, ambiguous). Rules are
     ``[{regex, replacement, _autogen: true, _kind, _detail}, ...]`` ready to
-    feed into the existing substitution pass. ``ambiguous`` lists XMRs we
-    refused to bind (multiple candidates / unknown widths) — the caller
-    raises `hier_substitution_ambiguous` if non-empty.
+    feed into the existing substitution pass. ``ambiguous`` lists the XMRs
+    that could not be bound (several candidates, or unknown widths); the
+    caller raises `hier_substitution_ambiguous` if it is not empty.
 
     Two-pass behavior:
 
-      Pass 1 (DC-flatten / ungroup convention) — look for a top-scope flat
-      wire named ``<inner_1>_<inner_2>_..._<sig>`` (chain joined by ``_``).
+      Pass 1 (names after DC flatten/ungroup): look for a top-level wire
+      named ``<inner_1>_<inner_2>_..._<sig>`` (chain joined by ``_``).
       If present, emit either a scalar-rename rule or an MSB-first slicing
       rule (MSB-first packing).
 
-      Pass 2 (keep-hierarchy convention) — if Pass 1's flat lookup fails,
+      Pass 2 (hierarchy kept): if Pass 1 finds no such wire,
       walk the instance chain ``(inner_1, inner_2, ..., inner_N)`` through
       nested module bodies in mapped.v (each step resolves an instance to
       its submodule type), then scan the innermost submod's body for
@@ -424,12 +422,10 @@ def _auto_derive_hier_substitutions(
           left-hand path kept hierarchical (``dut.<chain>.<sig>[i] ->
           dut.<chain>.<sig>[(N-1-i)*W +: W]``).
 
-    The chain walk handles wrapper-layer hierarchies introduced by layered
-    wrappers (e.g. a redundancy wrapper around the design exposes an extra
-    ``u_dut`` instance between the TB's ``dut`` and the original DUT submod
-    tree; chains of arbitrary depth resolve the same way). For a 1-level
-    chain (``dut.<inner>.<sig>``) behavior is byte-identical to the v0.1
-    flat / keep-hier paths.
+    The chain walk handles wrapper-layer hierarchies (e.g. a wrapper around
+    the design adds an instance between the TB's ``dut`` and the design's
+    sub-modules); chains of any depth resolve the same way as the 1-level
+    chain ``dut.<inner>.<sig>``.
 
     Pass 2 is essential for keep-hierarchy netlists (``dut.u_fifo.mem[i]``,
     ``dut.u_fifo.wptr``) AND for layered wrappers (``dut.u_dut.u_rf.mem[i]``).
@@ -450,8 +446,8 @@ def _auto_derive_hier_substitutions(
         # path is ``.tok1.tok2....tokN.sig``; strip leading ``.`` and split.
         path_tokens = m.group("path").lstrip(".").split(".")
         if len(path_tokens) < 2:
-            # Guarded by the regex {2,} quantifier, but defensive — a 1-token
-            # match would be ``dut.sig`` which the resolver is not in scope for.
+            # ``dut.sig`` (no instance in between) is not rewritten; the
+            # regex already excludes it.
             continue
         inner_chain = tuple(path_tokens[:-1])
         sig = path_tokens[-1]
@@ -481,9 +477,8 @@ def _auto_derive_hier_substitutions(
         xmr_display = (f"{dut_inst_name}.{chain_dotted}.{sig}"
                        f"{'[idx]' if is_indexed else ''}")
         flat_name = f"{chain_flat}_{sig}"
-        # Regex/replacement builders that work for any chain length. For the
-        # 1-inner case these produce strings byte-identical to the v0.1
-        # `dut\.<inner>\.<sig>` shape.
+        # Regex/replacement builders for any chain length; for one inner
+        # level they give the `dut\.<inner>\.<sig>` shape.
         path_escaped = re.escape(f"{dut_inst_name}.{chain_dotted}.{sig}")
         regex_nob = path_escaped + r"\b"
         regex_idx = path_escaped + r"\[([^\]]+)\]"
@@ -491,11 +486,9 @@ def _auto_derive_hier_substitutions(
         flat_path = f"{dut_inst_name}.{flat_name}"
 
         if flat_name not in flat_wires:
-            # Pass 2: keep-hier — walk the instance chain through mapped.v.
-            # The 1-element chain case is byte-equivalent to the v0.1
-            # ``top_inst_to_submod.get(inner)`` path because
-            # ``_walk_inst_chain(_, top_module, (inner,))`` just runs that
-            # same lookup once.
+            # Pass 2 (hierarchy kept): walk the instance chain through mapped.v
+            # (for a 1-element chain this is the ``top_inst_to_submod.get(inner)``
+            # lookup, run once).
             walk_result, walk_info = _walk_inst_chain(
                 mapped_text, top_module, inner_chain,
             )
@@ -560,7 +553,7 @@ def _auto_derive_hier_substitutions(
                 })
                 continue
             if not rng_m:
-                # Non-literal range string — refuse to guess.
+                # The range is not a literal: report it rather than guess.
                 ambiguous.append({
                     "xmr": xmr_display,
                     "reason": (
@@ -691,7 +684,7 @@ def _auto_derive_hier_substitutions(
 # The mapped.v emits each clone as an empty-bodied stub module (port list
 # only) and rewrites every instance to the suffixed name. `macro_rtl_subs`
 # only supplies the *generic* RTL body, so the suffixed instances bind to
-# nothing → outputs are X across the netlist sim.
+# nothing and their outputs are X in the netlist simulation.
 #
 # This helper scans mapped.v for `<M>_<suffix>` stub declarations, parses the
 # suffix into parameter overrides using the macro RTL's declared parameter
@@ -713,9 +706,8 @@ def _parse_macro_param_names(rtl_text: str, macro_module: str) -> list[str]:
     and return the declared parameter names in source order.
 
     Skips `localparam` (DC doesn't carry them in the uniquify suffix) and
-    only honors `parameter int|integer|bit|...` declarations. We don't try
-    to parse defaults — they'd be ignored anyway, since the wrapper passes
-    explicit overrides.
+    only honors `parameter int|integer|bit|...` declarations. Defaults are
+    not parsed: the wrapper passes every parameter explicitly.
     """
     # Locate `module <M> #( ... )(`. We find the first `module <M>` then
     # look for an optional `#(...)` block.
@@ -727,14 +719,14 @@ def _parse_macro_param_names(rtl_text: str, macro_module: str) -> list[str]:
     while j < n and rtl_text[j].isspace():
         j += 1
     if j >= n or rtl_text[j] != "#":
-        return []  # no parameter block → no overrides expressible in suffix
+        return []  # no parameter block: the suffix cannot encode overrides
     j += 1
     while j < n and rtl_text[j].isspace():
         j += 1
     if j >= n or rtl_text[j] != "(":
         return []
-    # Find matching close paren (paren-balanced — defaults like $clog2(X) are
-    # legal here too).
+    # Find the matching close paren; defaults such as $clog2(X) contain
+    # parentheses too.
     depth = 1
     open_i = j
     j += 1
@@ -794,7 +786,7 @@ def _parse_uniquify_suffix(suffix: str, param_names: list[str]
         out.append((nm, v_match.group(0)))
         s = s[v_match.end():]
         pi += 1
-    if s:  # leftover characters → didn't fully consume
+    if s:  # characters left over: the suffix did not parse completely
         return None
     return out
 
@@ -895,7 +887,7 @@ def _resolve_uniquified_macro_variants(
     # Index module-name set in mapped.v (pull directly from the regex above).
     declared = {m.group("name") for m in _MODULE_DECL_RE.finditer(mapped_text)}
 
-    # Build a generic-name → param_names map; we need this for suffix decode.
+    # generic module name -> its parameter names, to decode the suffixes
     rtl_text_by_macro: dict[str, str] = {}
     for ms in macro_subs:
         macro = ms.get("macro_module")
@@ -958,21 +950,14 @@ def _resolve_uniquified_macro_variants(
         if per_variant:
             resolved_log.append({"generic": macro, "variants": per_variant})
 
-    # Detect orphans: any module whose name has prefix `<M>_` for some unbound
-    # M (where M is NOT in macro_subs but might be in another file).
+    # Clones `<M>_<suffix>` of a macro M that has no RTL substitution are not
+    # reported: without M's parameter list their names cannot be told apart
+    # from ordinary modules. The clones of bound macros are handled above.
     declared_macros = set(rtl_text_by_macro.keys())
     bound_or_alias = set(declared_macros) | set(strip_names)
     for nm in declared:
         if nm in bound_or_alias:
             continue
-        # Look for prefix `<X>_` where X seems to be a parameterized macro
-        # but X is not bound. We surface only those whose generic body is
-        # not declared anywhere — bare module name is the user's signal.
-        # (Parameterized macro variants always have an underscore in the
-        # suffix; we keep this conservative — only flag if X happens to be
-        # the prefix of an existing rtl_subs entry but not a covered case.)
-        # The heuristic above already covers covered macros; nothing else
-        # to add here without producing false positives.
         pass
 
     if not wrapper_blocks:
