@@ -53,7 +53,7 @@ untimed_cells = []
 blackbox_cells = []
 # Clock pins whose SDF SETUP/HOLD checks give a flip-flop's sampling window, in order of
 # preference; if none has checks, the one clock pin that has them is used. Used by:
-# build, inject.
+# build, inject, logic.
 timing_check_clock_pins = ["CP", "CK", "CLK"]
 
 # --------------------------------------------------------------------------------------
@@ -184,7 +184,7 @@ pulse_widths_ps = [20, 40, 60, 80, 100, 120, 140, 160, 180]
 # Also inject on nets that drive flip-flop data pins. Used by: build.
 inject_ff_d_nets = true
 # Inject only on these nets, named as in the netlist with `/` between hierarchy levels
-# (default: every site).
+# (default: every site). Used by: inject, logic.
 sites = []
 
 # --------------------------------------------------------------------------------------
@@ -199,7 +199,7 @@ exclude_cells = []
 # Flip-flop instances not to observe: substrings of their names.
 exclude_instances = []
 # Leave flip-flops without SDF setup/hold checks unobserved instead of failing. Used by:
-# build, inject.
+# build, inject, logic.
 allow_missing_timing_checks = false
 
 # --------------------------------------------------------------------------------------
@@ -234,6 +234,12 @@ cycles_per_shard = 10
 # 0..steps), the sets of flip-flops upset together, each with the trials and start times
 # that give it (`setfi patterns` runs this stage alone).
 steps = 0
+# Parallel threads (does not change the results).
+jobs = 1
+
+# --------------------------------------------------------------------------------------
+# Which flip-flops a SET upsets, without timing (`setfi logic`). Used by: logic.
+[logic]
 # Parallel threads (does not change the results).
 jobs = 1
 

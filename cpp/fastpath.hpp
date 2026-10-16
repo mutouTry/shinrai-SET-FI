@@ -1,6 +1,6 @@
 // setfi._engine: data and helpers shared by the trial loop (engine.cpp,
-// run_block), the cone compiler (cone_compiler.cpp) and the pattern table
-// (patterns.cpp).
+// run_block), the cone compiler (cone_compiler.cpp), the pattern table
+// (patterns.cpp) and the logic-only translation (logic.cpp).
 #pragma once
 
 #include <pybind11/pybind11.h>
@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -92,10 +93,56 @@ struct CompiledCone {
   int32_t n_ff() const { return (int32_t)ffids.size(); }
 };
 
+// Bind a recorded state (bits: one byte per global net) to a cone, as the
+// Python trial loop did: recorded nets from the state (others 0), nets outside
+// the recording settled through their gates in cone order, wire pin nodes
+// copied from their drivers; dp_base = fault-free value of each recorded D net.
+inline void bind_state(const CompiledCone& c, const uint8_t* bits, int64_t n_glob, std::vector<uint8_t>& net_val,
+                       std::vector<uint8_t>& dp_base) {
+  const size_t n = c.gidx.size();
+  net_val.resize(n);
+  for (size_t i = 0; i < n; i++) {
+    const int32_t g = c.gidx[i];
+    if (g >= n_glob) throw std::out_of_range("global net index beyond the recorded state");
+    net_val[i] = (g >= 0) ? bits[g] : 0;
+  }
+  for (size_t s = 0; s < c.settle_gate.size(); s++) {
+    const int32_t gi = c.settle_gate[s];
+    int64_t idx = 0;
+    int j = 0;
+    for (int32_t k = c.settle_in_ptr[s]; k < c.settle_in_ptr[s + 1]; k++, j++) {
+      if (j >= 62) throw std::out_of_range("gate with too many inputs to settle");
+      idx |= (int64_t)(net_val[(size_t)c.settle_in[(size_t)k]] & 1) << j;
+    }
+    const int32_t ta = c.gate_truth_ptr[(size_t)gi], tb = c.gate_truth_ptr[(size_t)gi + 1];
+    uint8_t v;
+    if (tb - ta > 1) {
+      if (idx >= (int64_t)(tb - ta)) throw std::out_of_range("truth table index out of range");
+      v = c.gate_truth[(size_t)(ta + idx)];
+    } else if (tb - ta == 1) {
+      v = c.gate_truth[(size_t)ta];
+    } else {
+      throw std::out_of_range("empty truth table");
+    }
+    net_val[(size_t)c.gate_out[(size_t)gi]] = (uint8_t)(v & 1);
+  }
+  for (size_t w = 0; w < c.wp_drv.size(); w++)
+    net_val[(size_t)c.wp_sink[w]] = (uint8_t)(net_val[(size_t)c.wp_drv[w]] & 1);
+  dp_base.resize(c.dp_g.size());
+  for (size_t k = 0; k < c.dp_g.size(); k++) {
+    const int64_t g = c.dp_g[k];
+    if (g >= n_glob) throw std::out_of_range("global net index beyond the recorded state");
+    dp_base[k] = (g >= 0) ? bits[g] : 0;
+  }
+}
+
 // Registers CompiledCone, ConeCompiler and parse_site_cones (cone_compiler.cpp).
 void register_cone_compiler(pybind11::module_& m);
 
 // Registers PatternBuilder (patterns.cpp).
 void register_patterns(pybind11::module_& m);
+
+// Registers logic_block (logic.cpp).
+void register_logic(pybind11::module_& m);
 
 }  // namespace setfi_fast

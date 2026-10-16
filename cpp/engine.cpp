@@ -892,49 +892,6 @@ static ConeView cone_view_of(const setfi_fast::CompiledCone& c) {
   return cv;
 }
 
-// Bind a recorded state (bits: one byte per global net) to a cone, as the
-// Python trial loop did: recorded nets from the state (others 0), nets outside
-// the recording settled through their gates in cone order, wire pin nodes
-// copied from their drivers; dp_base = fault-free value of each recorded D net.
-static void bind_state(const setfi_fast::CompiledCone& c, const uint8_t* bits, int64_t n_glob,
-                       std::vector<uint8_t>& net_val, std::vector<uint8_t>& dp_base) {
-  const size_t n = c.gidx.size();
-  net_val.resize(n);
-  for (size_t i = 0; i < n; i++) {
-    const int32_t g = c.gidx[i];
-    if (g >= n_glob) throw std::out_of_range("run_block: global net index beyond the recorded state");
-    net_val[i] = (g >= 0) ? bits[g] : 0;
-  }
-  for (size_t s = 0; s < c.settle_gate.size(); s++) {
-    const int32_t gi = c.settle_gate[s];
-    int64_t idx = 0;
-    int j = 0;
-    for (int32_t k = c.settle_in_ptr[s]; k < c.settle_in_ptr[s + 1]; k++, j++) {
-      if (j >= 62) throw std::out_of_range("run_block: gate with too many inputs to settle");
-      idx |= (int64_t)(net_val[(size_t)c.settle_in[(size_t)k]] & 1) << j;
-    }
-    const int32_t ta = c.gate_truth_ptr[(size_t)gi], tb = c.gate_truth_ptr[(size_t)gi + 1];
-    uint8_t v;
-    if (tb - ta > 1) {
-      if (idx >= (int64_t)(tb - ta)) throw std::out_of_range("run_block: truth table index out of range");
-      v = c.gate_truth[(size_t)(ta + idx)];
-    } else if (tb - ta == 1) {
-      v = c.gate_truth[(size_t)ta];
-    } else {
-      throw std::out_of_range("run_block: empty truth table");
-    }
-    net_val[(size_t)c.gate_out[(size_t)gi]] = (uint8_t)(v & 1);
-  }
-  for (size_t w = 0; w < c.wp_drv.size(); w++)
-    net_val[(size_t)c.wp_sink[w]] = (uint8_t)(net_val[(size_t)c.wp_drv[w]] & 1);
-  dp_base.resize(c.dp_g.size());
-  for (size_t k = 0; k < c.dp_g.size(); k++) {
-    const int64_t g = c.dp_g[k];
-    if (g >= n_glob) throw std::out_of_range("run_block: global net index beyond the recorded state");
-    dp_base[k] = (g >= 0) ? bits[g] : 0;
-  }
-}
-
 // per-site counters returned by run_block (columns of "site_stats"; the
 // order of setfi.campaign.run.SITE_STATS)
 enum SiteStat {
@@ -1038,7 +995,7 @@ static py::dict run_block(py::list cones_list,
         const size_t item = (size_t)(k * n_sites + j);
         rec_start[item] = (int64_t)o.cycle.size();
         try {
-          bind_state(c, states_p + (size_t)(k * n_glob), n_glob, o.net_val, o.dp_base);
+          setfi_fast::bind_state(c, states_p + (size_t)(k * n_glob), n_glob, o.net_val, o.dp_base);
           const int32_t v0 = (int32_t)(o.net_val[(size_t)c.src_i] & 1);
           simulate_pulses_core(
               cv, dv, o.net_val.data(), c.src_i, v0, v0 ^ 1, pws, n_pw, opt.sim_end_ps, opt.eps_ps,
@@ -1231,4 +1188,5 @@ cycle k and cone j; site_stats[j] the trial counters of cone j.)doc");
 
   setfi_fast::register_cone_compiler(m);
   setfi_fast::register_patterns(m);
+  setfi_fast::register_logic(m);
 }

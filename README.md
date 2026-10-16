@@ -16,6 +16,7 @@ which flip-flops capture a wrong value.
 | `record` | `build/`, testbench, simulator | `record/`: circuit state of the sampled cycles |
 | `inject` | `build/`, `record/`, pulse widths | `inject/`: one record per pulse arriving at a flip-flop data pin |
 | `patterns` | `inject/` | `patterns/`: the sets of flip-flops upset together, and where from (optional) |
+| `logic` | `build/`, `record/` | `logic/`: the same table without timing (optional) |
 | `analyze` | `inject/`, width models | `analyze/<width model>/`: upset probabilities |
 
 Propagation accounts for logical masking, inertial (electrical) filtering,
@@ -23,6 +24,10 @@ rise/fall and conditional delays, and reconvergent paths. One simulation per
 (cycle, site, width) covers all start times in the cycle, so any pulse-width
 distribution can be evaluated afterwards without a new campaign. The model is
 defined in [docs/MODEL.md](docs/MODEL.md).
+
+`logic` is a fast logic-only alternative to `inject` and `patterns`: it
+inverts each site in each sampled cycle and takes every flip-flop whose data
+pin changes as upset, with no delays, filtering or capture window.
 
 ## Install
 
@@ -86,7 +91,7 @@ width_models = [{ type = "gaussian", mean_ps = 90, sd_ps = 40 },
                 { type = "exponential", tau_ps = 40 }]
 ```
 
-Each stage can be run alone: `setfi build | record | inject | patterns | analyze -c setfi.toml`.
+Each stage can be run alone: `setfi build | record | inject | patterns | logic | analyze -c setfi.toml`.
 A stage runs only if a configuration key it reads (the template says which),
 one of its input files, or the result of an earlier stage has changed
 (`--force` runs it anyway). Width models only weight the pulse records, so
@@ -104,10 +109,11 @@ keeps the cycles of the smaller sample and adds new ones.
 ```
 <dir>/
   stages.json     what each stage ran from; decides what is out of date
-  build/          timing graph, injection sites and fan-out cones, read by inject
+  build/          timing graph, injection sites and fan-out cones, read by inject and logic
   record/         states/cycle_<N>.hex: the circuit state of each sampled cycle
   inject/         pulse records
   patterns/       patterns.npz, patterns.csv (with [patterns] steps > 0)
+  logic/          patterns.npz, patterns.csv (setfi logic)
   analyze/
     <model>/      summary.json, per_ff.csv, per_site.csv, per_width.csv
 ```
@@ -134,10 +140,11 @@ stages the change does not affect are reused. Width models need no new campaign.
 | `analyze/<model>/` | Upset probabilities for one pulse-width model: `summary.json`, `per_ff.csv`, `per_site.csv`, `per_width.csv`. |
 | `patterns/patterns.npz` | The pattern table, for SET start times on the grid k*T/steps (`[patterns] steps`, k = 0..steps): each set F of flip-flops that SETs upset together in a cycle, the number of grid points (site, width, k) at which a SET upsets exactly F, and those points as runs of consecutive k per trial (`Patterns.grid_points()` expands them, one row per point). |
 | `patterns/patterns.csv` | One row per pattern: cycle, multiplicity, number of flip-flops, number of sites, flip-flop ids. |
+| `logic/patterns.npz`, `logic/patterns.csv` | The pattern table of `setfi logic`, in the same format: each set F of flip-flops whose data pins change together when a site is inverted in a cycle, with the sites that give it. |
 
 ```python
 from setfi.analysis.patterns import Patterns
-pt = Patterns.load("runs/my_top/patterns/patterns.npz")
+pt = Patterns.load("runs/my_top/patterns/patterns.npz")      # or logic/patterns.npz
 print(pt.count, pt.cycle(0), pt.multiplicity(0), pt.ffs(0, names=True), pt.sources(0)[:3])
 ```
 

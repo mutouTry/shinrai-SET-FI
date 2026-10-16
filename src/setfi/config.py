@@ -53,11 +53,12 @@ SECTIONS = {
     "propagation": "How a pulse propagates through the gates.",
     "inject": "How the injection campaign runs.",
     "patterns": "Which flip-flops SETs upset together, and where from.",
+    "logic": "Which flip-flops a SET upsets, without timing (`setfi logic`).",
     "analyze": "How upset probabilities are computed.",
     "build": "Advanced options of the netlist and SDF reader.",
 }
 
-STAGES = ("build", "record", "inject", "patterns", "analyze")
+STAGES = ("build", "record", "inject", "patterns", "logic", "analyze")
 
 # The configuration each stage reads: whole sections, or (section, key) pairs.  A
 # stage is re-run when one of these values (for files: their content) changes.
@@ -72,11 +73,13 @@ STAGE_KEYS = {
                ("library", "timing_check_clock_pins"),
                ("observe", "allow_missing_timing_checks")],
     "patterns": ["patterns"],
+    "logic": ["logic", ("fault_model", "sites"), ("library", "timing_check_clock_pins"),
+              ("observe", "allow_missing_timing_checks")],
     "analyze": ["analyze"],
 }
 # Keys that change how a stage runs, not its result.
 EXECUTION_ONLY = {("inject", "jobs"), ("inject", "cycles_per_shard"), ("patterns", "jobs"),
-                  ("workload", "compile_timeout_s"), ("workload", "sim_timeout_s")}
+                  ("logic", "jobs"), ("workload", "compile_timeout_s"), ("workload", "sim_timeout_s")}
 
 
 def stage_keys(stage: str, cfg: Dict[str, Dict[str, Any]]) -> List[Tuple[str, str]]:
@@ -274,6 +277,9 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
                     "alone)."),
         "jobs": _k("int", 1, "Parallel threads (does not change the results)."),
     },
+    "logic": {
+        "jobs": _k("int", 1, "Parallel threads (does not change the results)."),
+    },
     "observe": {
         "data_pins": _k("strs", [], "Observe only flip-flops whose data pin has one of these "
                                     "names (default: library.d_pins). Clock gates, whose "
@@ -303,7 +309,7 @@ EXTRA_SECTIONS: Dict[str, Dict[str, Key]] = {}
 
 # Section order of the template: what every user sets first, advanced knobs last.
 ORDER = ["design", "output", "library", "workload", "simulator", "fault_model", "observe",
-         "propagation", "inject", "patterns", "analyze", "build"]
+         "propagation", "inject", "patterns", "logic", "analyze", "build"]
 
 
 def schema() -> Dict[str, Dict[str, Key]]:
@@ -502,7 +508,7 @@ def validate(cfg: Dict[str, Dict[str, Any]], check_files: bool = True,
                           f"must be a whole number of ps, at least 0.001 ns")
     for sec, key, lo in (("workload", "n_cycles", 1), ("inject", "jobs", 1),
                          ("inject", "cycles_per_shard", 1),
-                         ("patterns", "steps", 0), ("patterns", "jobs", 1),
+                         ("patterns", "steps", 0), ("patterns", "jobs", 1), ("logic", "jobs", 1),
                          ("workload", "padding_cycles", 0), ("workload", "warmup_cycles", 0),
                          ("workload", "reserve_factor", 0)):
         if cfg[sec][key] < lo:

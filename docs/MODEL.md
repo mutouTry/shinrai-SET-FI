@@ -91,6 +91,17 @@ weights). The density is evaluated at the injected widths and normalised over
 them, so the widths act as the points of a discrete distribution; inject evenly
 spaced widths to approximate a continuous one.
 
+## Logic only
+
+`setfi logic` keeps the cycles, the sites and logical masking, and drops the
+width, the start time and all delays. For each (cycle, site), the site is
+inverted in the recorded state and the gates of its fan-out cone whose inputs
+change are re-evaluated in topological order; every other net keeps its
+recorded value. Every observed flip-flop whose data pin then differs from its
+recorded value is upset: there is no inertial filtering and no capture window,
+and paths that reconverge give the steady value only, never a glitch. The
+result is the set F of upset flip-flops per (cycle, site).
+
 ## Scope
 
 * One SET per trial, on one net; every site has the same weight.

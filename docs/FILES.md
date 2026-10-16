@@ -12,8 +12,8 @@ runs again.
 
 ## build/
 
-The data `inject` reads. Nets and flip-flops are numbered here; the other
-stages refer to these numbers.
+The data `inject` and `logic` read. Nets and flip-flops are numbered here; the
+other stages refer to these numbers.
 
 | File | Content |
 |---|---|
@@ -106,6 +106,26 @@ pattern add up to its multiplicity. `patterns.csv` has one row per pattern,
 `pattern,cycle,multiplicity,n_ffs,n_sites,ffs` (`pattern` is its index p in
 `patterns.npz`, `ffs` its flip-flop ids separated by `|`). `src/setfi/analysis/patterns.py`
 reads the format.
+
+## logic/
+
+Written by `setfi logic`: `patterns.npz` and `patterns.csv` in the format of
+`patterns/`, which `src/setfi/analysis/patterns.py` reads unchanged. A pattern
+is a pair (cycle, F), F not empty: the flip-flops whose data pins change when a
+site is inverted in that cycle (docs/MODEL.md). `cycles`, `sites`, `ff_ids` and
+`ff_instances` are those `inject` uses with the same configuration. The table
+has no start times and no pulse widths, and holds neutral values for them:
+
+| Array | Value |
+|---|---|
+| `period_ps`, `steps` | 0 (a table of `patterns/` has steps >= 1) |
+| `starts_ps` | `[0]` |
+| `pulse_widths_ps` | empty |
+| `run_width_ps`, `run_k_lo`, `run_k_hi` | 0 |
+
+Each run is one site, so `pattern_multiplicity` and `pattern_n_sites` both
+count the sites that give the pattern, and `Patterns.grid_points()` has one row
+per (cycle, site) whose SET changes a data pin.
 
 ## analyze/\<name\>/
 
