@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from setfi.build import BuildError, BuildSpec, LibrarySpec, run_build
-from setfi.build.netlist import elaborate, parse_modules, strip_comments
+from setfi.build.netlist import elaborate, parse_modules, resolve_net, strip_comments
 
 LIB = """
 // assign-style behavioural library
@@ -608,3 +608,111 @@ def test_hierarchy_does_not_change_the_sites(tmp_path):
         assert not man["warnings"]
     assert sites["flat"] == ["n1", "n2", "q0"]
     assert sites["hier"] == ["b/n1", "n2", "q0"]
+
+
+# The parent leaves the outputs z and w of `b` unconnected; z is also read inside `b`.
+OPEN_FLAT = """
+module top (clk, a, y);
+  input clk, a; output y;
+  wire q, z, n; wire [1:0] w;
+  DFF r0 (.D(a), .CP(clk), .Q(q));
+  INV u0 (.A(q), .ZN(z));
+  ND2 u1 (.A1(z), .A2(a), .ZN(n));
+  DFF r1 (.D(n), .CP(clk), .Q(w[0]));
+  INV u2 (.A(w[0]), .ZN(w[1]));
+  INV u3 (.A(q), .ZN(y));
+endmodule
+"""
+OPEN_HIER = """
+module blk (clk, d, q, z, w);
+  input clk, d; output q, z; output [1:0] w;
+  wire n;
+  DFF r0 (.D(d), .CP(clk), .Q(q));
+  INV u0 (.A(q), .ZN(z));
+  ND2 u1 (.A1(z), .A2(d), .ZN(n));
+  DFF r1 (.D(n), .CP(clk), .Q(w[0]));
+  INV u2 (.A(w[0]), .ZN(w[1]));
+endmodule
+module top (clk, a, y);
+  input clk, a; output y;
+  wire q;
+  blk b (.clk(clk), .d(a), .q(q));
+  INV u3 (.A(q), .ZN(y));
+endmodule
+"""
+
+
+def _open_sdf(prefix):
+    ff = ('(CELL (CELLTYPE "DFF") (INSTANCE {n}) (DELAY (ABSOLUTE (IOPATH (posedge CP) Q (0.05))))'
+          ' (TIMINGCHECK (SETUP D (posedge CP) (0.02)) (HOLD D (posedge CP) (0.01))))\n')
+    inv = '(CELL (CELLTYPE "INV") (INSTANCE {n}) (DELAY (ABSOLUTE (IOPATH A ZN (0.01)))))\n'
+    return ('(DELAYFILE (SDFVERSION "3.0") (DESIGN "top") (TIMESCALE 1ns) (DIVIDER /)\n'
+            + ff.format(n=prefix + "r0") + ff.format(n=prefix + "r1")
+            + "".join(inv.format(n=n) for n in (prefix + "u0", prefix + "u2", "u3"))
+            + f'(CELL (CELLTYPE "ND2") (INSTANCE {prefix}u1) (DELAY (ABSOLUTE '
+              '(IOPATH A1 ZN (0.02)) (IOPATH A2 ZN (0.02)))))\n)\n')
+
+
+def _xmr_resolves(xmr, modules, top):
+    """Whether `tb.dut.<instance>...<net>` names a net of the netlist: every instance on
+    the path exists, and the net is a port of, or connected in, the module it ends in."""
+    *path, leaf = xmr.split(".")[2:]
+    mod = modules[top]
+    for name in path:
+        inst = next((i for i in mod.instances if i.name == name), None)
+        if inst is None or inst.celltype not in modules:
+            return False
+        mod = modules[inst.celltype]
+    nets = mod.ports | {n.split("[")[0] for i in mod.instances for n in i.pin2net.values()}
+    return leaf.split("[")[0] in nets
+
+
+def test_unconnected_port_is_named_by_its_instance_path(tmp_path):
+    """A port that the parent leaves unconnected is a net inside the instance: it is named
+    by the instance path, like the other nets of the instance, and the recorder reads it
+    there."""
+    import re
+    from setfi.workload.tbgen import emit_recorder_program, load_taps, resolve_taps
+    got = {}
+    for name, text, prefix in (("flat", OPEN_FLAT, ""), ("hier", OPEN_HIER, "b/")):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "cells.v").write_text(HIER_CELLS)
+        (d / "net.v").write_text(text)
+        (d / "net.sdf").write_text(_open_sdf(prefix))
+        man = run_build(BuildSpec(netlist=str(d / "net.v"), sdf=str(d / "net.sdf"), top="top",
+                                  out_dir=str(d / "out"),
+                                  library=LibrarySpec(behavioral_verilog=str(d / "cells.v"))))
+        assert not man["warnings"]
+        idx = json.loads((d / "out" / "net_index.json").read_text())["idx_to_net"]
+        sites = [idx[str(json.loads(l)["src_net_idx"])]
+                 for l in (d / "out" / "site_cones.jsonl").read_text().splitlines()]
+        arcs = [(e["src_net"], e["dst_net"])
+                for e in json.loads((d / "out" / "edges.json").read_text())]
+        got[name] = (sorted(idx.values()), sorted(sites), sorted(arcs))
+
+    # The hierarchical build is the flat one with the nets of `b` under `b/`.
+    def placed(net):
+        return f"b/{net}" if net in ("n", "z", "w[0]", "w[1]") else net
+    nets, sites, arcs = got["flat"]
+    assert got["hier"] == (sorted(map(placed, nets)), sorted(map(placed, sites)),
+                           sorted((placed(s), placed(t)) for s, t in arcs))
+    assert got["hier"][1] == ["a", "b/n", "b/z"]
+
+    # Every net the recorder reads is at an existing place in the hierarchy.
+    out = tmp_path / "hier" / "out"
+    taps, ff_nets = load_taps(out / "net_index.json", out / "ff_index.json")
+    bindings, _ = resolve_taps(taps, "dut", ff_nets)
+    emit_recorder_program(tmp_path / "rec.svh", tmp_path / "rec.sv", bindings=bindings,
+                          sample_cycles=[1], clk_net="clk", rst_guard="1'b1", version="t")
+    reads = re.findall(r"= (tb\.dut\.\S+);", (tmp_path / "rec.svh").read_text())
+    assert len(reads) == len(taps) and "tb.dut.b.z" in reads
+    modules = parse_modules(OPEN_HIER)
+    assert [r for r in reads if not _xmr_resolves(r, modules, "top")] == []
+
+
+def test_unconnected_port_reference_shapes():
+    # a whole port, one bit and a slice of an unconnected port; a connected port for contrast
+    ports, conn = {"z", "w", "c"}, {"c": "top_net"}
+    assert [resolve_net(x, "b", ports, conn, {"w": (1, 0)})
+            for x in ("z", "w[1]", "w[1:0]", "c")] == ["b/z", "b/w[1]", "b/w[1:0]", "top_net"]
