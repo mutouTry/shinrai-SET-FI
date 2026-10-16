@@ -5,8 +5,8 @@ Given the text of a structural (mapped) Verilog netlist, ``parse_modules`` retur
 instances with their named-port connections).  ``elaborate`` walks the hierarchy from the
 top module and returns one :class:`Instance` per leaf, keyed by its hierarchical path
 (``/`` separator, the SDF divider), with every pin resolved to a GLOBAL net name:
-sub-module ports are replaced by whatever the parent connected, local wires are prefixed
-with the instance path.
+sub-module ports are replaced by whatever the parent connected, local wires (and ports
+the parent leaves unconnected) are prefixed with the instance path.
 
 Hierarchy (wrapper modules that synthesis kept unflattened) is the normal case, not an
 option: a parser that only reads the top body misses every leaf inside a wrapper.
@@ -545,11 +545,11 @@ def resolve_net(local_net: str,
                 conn_ranges: Optional[Dict[str, Tuple[int, int]]] = None) -> str:
     """Resolve a net referenced inside a sub-module instance to its global name.
 
-      * If the net is one of the sub-module's ports, the resolved value is
-        whatever the parent connected to that port.  An unconnected port keeps
-        its local name.
-      * Otherwise the net is a local wire; it is namespace-qualified with the
-        instance path.
+      * If the net is a port that the parent connected, the resolved value is
+        whatever the parent connected to that port.
+      * Otherwise the net is local to the instance; it is namespace-qualified
+        with the instance path.  A port that the parent leaves unconnected is
+        local too: its net exists only inside the instance.
 
     Bus-bit references like ``n[3]`` compare the base identifier (``n``) to the
     port set; the qualified output keeps the bit suffix.
@@ -608,26 +608,22 @@ def resolve_net(local_net: str,
                                   for i in range(msb, lsb + step, step)]):
                 return f"{conn}[{msb}:{lsb}]"
             return "{" + ", ".join(elems) + "}"
-        if base in module_ports:
-            return local_net              # unconnected -- keep as-is
         return f"{inst_path}/{local_net}" if inst_path else local_net
 
     bus_m = _BITREF_RE.match(local_net)
     if bus_m:
         base = bus_m.group(1)
         bit = int(bus_m.group(2))
-        if base in module_ports:
-            if base in parent_pin2net:
-                return _port_bit_of_expr(base, bit, parent_pin2net[base],
-                                         port_ranges, inst_path, conn_ranges)
-            return f"{base}[{bit}]"       # unconnected -- keep as-is
+        if base in module_ports and base in parent_pin2net:
+            return _port_bit_of_expr(base, bit, parent_pin2net[base],
+                                     port_ranges, inst_path, conn_ranges)
         if inst_path:
             return f"{inst_path}/{base}[{bit}]"
         return f"{base}[{bit}]"
 
     # Plain identifier
-    if local_net in module_ports:
-        return parent_pin2net.get(local_net, local_net)
+    if local_net in module_ports and local_net in parent_pin2net:
+        return parent_pin2net[local_net]
     # Constants (1'b0, 1'b1, etc) and tied nets stay verbatim
     if re.match(r"^\d", local_net) or local_net in ("", "1'b0", "1'b1"):
         return local_net
