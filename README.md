@@ -16,7 +16,6 @@ which flip-flops capture a wrong value.
 | `record` | `build/`, testbench, simulator | `record/`: circuit state of the sampled cycles |
 | `inject` | `build/`, `record/`, pulse widths | `inject/`: one record per pulse arriving at a flip-flop data pin |
 | `patterns` | `inject/` | `patterns/`: the sets of flip-flops upset together, and where from (optional) |
-| `logic` | `build/`, `record/` | `logic/`: the same table without timing (optional) |
 | `analyze` | `inject/`, width models | `analyze/<width model>/`: upset probabilities |
 
 Propagation accounts for logical masking, inertial (electrical) filtering,
@@ -24,10 +23,6 @@ rise/fall and conditional delays, and reconvergent paths. One simulation per
 (cycle, site, width) covers all start times in the cycle, so any pulse-width
 distribution can be evaluated afterwards without a new campaign. The model is
 defined in [docs/MODEL.md](docs/MODEL.md).
-
-`logic` is a fast logic-only alternative to `inject` and `patterns`: it
-inverts each site in each sampled cycle and takes every flip-flop whose data
-pin changes as upset, with no delays, filtering or capture window.
 
 ## Install
 
@@ -91,7 +86,8 @@ width_models = [{ type = "gaussian", mean_ps = 90, sd_ps = 40 },
                 { type = "exponential", tau_ps = 40 }]
 ```
 
-Each stage can be run alone: `setfi build | record | inject | patterns | logic | analyze -c setfi.toml`.
+Each stage can be run alone: `setfi build | record | inject | patterns | analyze -c setfi.toml`
+(`setfi logic` writes the pattern table without timing, see [docs/MODEL.md](docs/MODEL.md)).
 A stage runs only if a configuration key it reads (the template says which),
 one of its input files, or the result of an earlier stage has changed
 (`--force` runs it anyway). Width models only weight the pulse records, so
