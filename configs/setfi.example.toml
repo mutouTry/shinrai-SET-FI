@@ -218,6 +218,11 @@ sdf_rail = "late"
 interconnect = "ignore"
 # Simulate each SET for this many clock periods (>= 1).
 horizon_factor = 1.25
+# Follow VCS where the SDF leaves a choice, for point-by-point comparisons with an
+# SDF-annotated gate-level simulation: a gate output change whose changed inputs have
+# only inactive COND paths takes zero delay, and a pulse at the D pin from the SET start
+# is captured by a SET that starts at the capture edge.
+vcs_align = false
 
 # --------------------------------------------------------------------------------------
 # How the injection campaign runs. Used by: inject.

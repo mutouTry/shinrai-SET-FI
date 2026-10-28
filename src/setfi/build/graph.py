@@ -68,8 +68,10 @@ def build_pin_to_net_map(instances: Dict[str, Instance]) -> Dict[str, str]:
     return mp
 
 
-def build_net_index(nets: Set[str]) -> Tuple[Dict[str, int], Dict[int, str]]:
-    net_to_idx = {n: i for i, n in enumerate(sorted(nets))}
+def build_net_index(nets: Set[str], extra: Iterable[str] = ()) -> Tuple[Dict[str, int], Dict[int, str]]:
+    """Nets numbered in name order, then the ``extra`` nets not among them."""
+    order = sorted(nets) + sorted(set(extra) - set(nets))
+    net_to_idx = {n: i for i, n in enumerate(order)}
     idx_to_net = {i: n for n, i in net_to_idx.items()}
     return net_to_idx, idx_to_net
 
@@ -117,6 +119,7 @@ class RawGraph:
     missing_ff: List[str]
     unknown_types: Dict[str, int]
     non_lib_connected_nets: Set[str]
+    seq_pin_nets: Set[str] = field(default_factory=set)
 
 
 def build_graph(instances: Dict[str, Instance], lib: Dict[str, Cell],
@@ -167,10 +170,12 @@ def build_graph(instances: Dict[str, Instance], lib: Dict[str, Cell],
     all_ff_records: List[Dict[str, Any]] = []
     all_dnet_to_insts: Dict[str, List[str]] = defaultdict(list)
     all_qnet_to_insts: Dict[str, List[str]] = defaultdict(list)
+    seq_pin_nets: Set[str] = set()     # nets on the other input pins of sequential cells
     for instname, inst in instances.items():
         cell = lib.get(inst.celltype)
         if cell is None or not cell.is_sequential:
             continue
+        seq_pin_nets.update(inst.pin2net[p] for p in cell.inputs if p in inst.pin2net)
         dnet, dp_used = None, None
         for dp in cell.d_pins:
             if dp in inst.pin2net:
@@ -223,6 +228,7 @@ def build_graph(instances: Dict[str, Instance], lib: Dict[str, Cell],
         all_stop_nets=set(all_dnet_to_insts.keys()), all_q_nets=set(all_qnet_to_insts.keys()),
         target_stop_dnets=target_stop_dnets, ff_order=ff_order, missing_ff=missing_ff,
         unknown_types=dict(unknown_types), non_lib_connected_nets=non_lib_connected_nets,
+        seq_pin_nets={n for n in seq_pin_nets if n and not re.match(r"^\d", n)},
     )
 
 
@@ -892,7 +898,9 @@ def build_stage(instances: Dict[str, Instance], lib: Dict[str, Cell],
                                adj_sub_eids_set)
 
     # ---------- indices ----------
-    net_to_idx, idx_to_net = build_net_index(nets)
+    # the other pins of the sequential cells are recorded for their timing-check
+    # conditions, numbered after the other nets; they are not sites
+    net_to_idx, idx_to_net = build_net_index(nets, g.seq_pin_nets)
     inst_to_idx, idx_to_inst = build_inst_index(instances)
     pin_to_net = build_pin_to_net_map(instances)
 

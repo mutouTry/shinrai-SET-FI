@@ -178,7 +178,8 @@ def test_small_design_graph(tmp_path):
     out = spec.out_dir
 
     ni = load(out, "net_index.json")
-    assert list(ni["net_to_idx"]) == ["in0", "n0", "n1", "n2", "n3", "out0", "q0", "q1", "tie"]
+    assert list(ni["net_to_idx"]) == ["in0", "n0", "n1", "n2", "n3", "out0", "q0", "q1", "tie",
+                                     "clk"]  # FF clock pin: recorded, numbered last, not a site
     idx = ni["net_to_idx"]
 
     edges = load(out, "edges.json")

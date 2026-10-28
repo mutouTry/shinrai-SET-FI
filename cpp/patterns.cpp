@@ -8,7 +8,10 @@
 // start times s with
 //     leave[base][ff] - t_exit + 1  <=  s  <=  enter[base][ff] - t_enter - 1
 // (no lower bound when t_exit >= inf_ps; setfi.records), that is at the grid
-// indices k0 <= k < k1.  Sweeping these range ends in order of k gives F(k),
+// indices k0 <= k < k1.  enter and leave are the FF's window in the record's
+// cycle: the FF's own, or one of the exceptions given by cycle.  With step_ps >=
+// 0, a record with t_enter = 0 also captures at the grid point step_ps.
+// Sweeping these range ends in order of k gives F(k),
 // which only changes at a range end.  Each maximal range k_lo..k_hi of grid
 // indices with one non-empty F is a run (site, width, k_lo, k_hi) of the
 // pattern (cycle, F).
@@ -200,7 +203,8 @@ struct Sweep {
 class PatternBuilder {
  public:
   PatternBuilder(I64Arr starts_ps, I64Arr enter, I64Arr leave, I64Arr cycles, int64_t n_sites,
-                 I64Arr widths_ps, int64_t inf_ps)
+                 I64Arr widths_ps, int64_t inf_ps, I64Arr exc_cycles, I64Arr exc_ffs, I64Arr exc_enter,
+                 I64Arr exc_leave, int64_t step_ps)
       : n_sites_(n_sites), inf_ps_(inf_ps) {
     if (starts_ps.ndim() != 1 || starts_ps.size() == 0)
       throw std::invalid_argument("PatternBuilder: starts_ps must be a non-empty 1-D array");
@@ -224,6 +228,21 @@ class PatternBuilder {
     n_widths_ = (int64_t)widths_ps.size();
     if ((double)n_sites * (double)n_widths_ > 1e11)
       throw std::invalid_argument("PatternBuilder: more than 10^11 trials per cycle");
+    const int64_t n_exc = (int64_t)exc_cycles.size();
+    if (exc_ffs.size() != n_exc || exc_enter.size() != 2 * n_exc || exc_leave.size() != 2 * n_exc)
+      throw std::invalid_argument("PatternBuilder: exc_ffs, exc_enter [n, 2], exc_leave [n, 2] must match exc_cycles");
+    exc_enter_.assign(exc_enter.data(), exc_enter.data() + 2 * n_exc);
+    exc_leave_.assign(exc_leave.data(), exc_leave.data() + 2 * n_exc);
+    for (int64_t i = 0; i < n_exc; i++) {
+      const int64_t f = exc_ffs.data()[i];
+      if (f < 0 || f >= n_ff_) throw std::invalid_argument("PatternBuilder: exception FF id out of range");
+      exc_row_[exc_key(cycle_index((int32_t)exc_cycles.data()[i]), (int32_t)f)] = i;
+    }
+    step_k_ = -1;
+    if (step_ps >= 0) {
+      const auto it = std::lower_bound(starts_.begin(), starts_.end(), step_ps);
+      if (it != starts_.end() && *it == step_ps) step_k_ = (int32_t)(it - starts_.begin());
+    }
   }
 
   // Sweep the trials of one dict of records (a record file) into the tables.
@@ -353,6 +372,8 @@ class PatternBuilder {
     return c->second;
   }
 
+  int64_t exc_key(int32_t cycle_idx, int32_t ff) const { return (int64_t)cycle_idx * n_ff_ + ff; }
+
   int64_t trial_key(int32_t site, int32_t width_ps) const {
     const auto w = width_index_.find(width_ps);
     if (w == width_index_.end())
@@ -385,14 +406,26 @@ class PatternBuilder {
     o.ends.clear();
     for (int64_t i = t.begin; i < t.end; i++) {
       const size_t at = (size_t)rc.base[i] * (size_t)n_ff_ + (size_t)rc.ff[i];
-      const int64_t s_high = enter_[at] - rc.t_enter[i] - 1;
+      int64_t enter = enter_[at], leave = leave_[at];
+      if (!exc_row_.empty()) {
+        const auto e = exc_row_.find(exc_key(t.cycle, rc.ff[i]));
+        if (e != exc_row_.end()) {
+          enter = exc_enter_[(size_t)(2 * e->second + rc.base[i])];
+          leave = exc_leave_[(size_t)(2 * e->second + rc.base[i])];
+        }
+      }
+      const int64_t s_high = enter - rc.t_enter[i] - 1;
       const int32_t k1 = (int32_t)(std::upper_bound(s, s + n_st, s_high) - s);
       const int32_t k0 = rc.t_exit[i] >= inf_ps_
                              ? 0
-                             : (int32_t)(std::lower_bound(s, s + n_st, leave_[at] - rc.t_exit[i] + 1) - s);
+                             : (int32_t)(std::lower_bound(s, s + n_st, leave - rc.t_exit[i] + 1) - s);
       if (k0 < k1) {
         o.ends.push_back({k0, rc.ff[i], +1});
         o.ends.push_back({k1, rc.ff[i], -1});
+      }
+      if (step_k_ >= 0 && rc.t_enter[i] == 0 && !(k0 <= step_k_ && step_k_ < k1)) {
+        o.ends.push_back({step_k_, rc.ff[i], +1});
+        o.ends.push_back({step_k_ + 1, rc.ff[i], -1});
       }
     }
     std::sort(o.ends.begin(), o.ends.end());
@@ -497,6 +530,9 @@ class PatternBuilder {
   }
 
   std::vector<int64_t> starts_, enter_, leave_;  // enter_ / leave_: [2, n_ff_] row-major
+  std::vector<int64_t> exc_enter_, exc_leave_;    // [n_exc, 2] row-major
+  std::unordered_map<int64_t, int64_t> exc_row_;  // (cycle index, ff) -> exception row
+  int32_t step_k_ = -1;                           // the grid index of step_ps, or -1
   int32_t n_ff_ = 0;
   int64_t n_sites_ = 0, n_widths_ = 0;
   int64_t inf_ps_ = 0;
@@ -514,10 +550,16 @@ record file at a time (setfi.analysis.patterns.compute_patterns drives it).
 
 starts_ps: the grid of SET start times; enter, leave: the capture thresholds
 [2, n_ff_ids] (setfi.records.Records.thresholds); cycles, n_sites, widths_ps:
-the trials of the campaign; inf_ps: the t_exit of an open-ended pulse.)doc")
-      .def(py::init<I64Arr, I64Arr, I64Arr, I64Arr, int64_t, I64Arr, int64_t>(), py::arg("starts_ps"),
-           py::arg("enter"), py::arg("leave"), py::arg("cycles"), py::arg("n_sites"), py::arg("widths_ps"),
-           py::arg("inf_ps"))
+the trials of the campaign; inf_ps: the t_exit of an open-ended pulse;
+exc_cycles, exc_ffs, exc_enter, exc_leave: the windows that differ by cycle
+(setfi.records.Records.window_exceptions); step_ps: with propagation.vcs_align,
+the capture edge, at which a record with t_enter = 0 captures (-1: none).)doc")
+      .def(py::init<I64Arr, I64Arr, I64Arr, I64Arr, int64_t, I64Arr, int64_t, I64Arr, I64Arr, I64Arr, I64Arr,
+                    int64_t>(),
+           py::arg("starts_ps"), py::arg("enter"), py::arg("leave"), py::arg("cycles"), py::arg("n_sites"),
+           py::arg("widths_ps"), py::arg("inf_ps"), py::arg("exc_cycles") = I64Arr(0),
+           py::arg("exc_ffs") = I64Arr(0), py::arg("exc_enter") = I64Arr(0), py::arg("exc_leave") = I64Arr(0),
+           py::arg("step_ps") = -1)
       .def("add", &PatternBuilder::add, py::arg("records"),
            R"doc(Sweep the trials of a dict of record columns (one record file): each block of
 consecutive records with one (cycle, site, width_ps) is one trial.  Several

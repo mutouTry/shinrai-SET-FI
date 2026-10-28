@@ -24,7 +24,7 @@ def campaign_spec_from_config(cfg, paths: Dict[str, str]):
         stage_dir=paths["build"], state_dir=state_dir, cycles=read_sampled_cycles(meta),
         out_dir=paths["inject"], clock_period_ps=T,
         pulse_widths_ps=sorted(set(int(w) for w in cfg["fault_model"]["pulse_widths_ps"])),
-        sim_horizon_ps=horizon, delay_choice=prop["delay_choice"],
+        sim_horizon_ps=horizon, delay_choice=prop["delay_choice"], vcs_align=prop["vcs_align"],
         interconnect=prop["interconnect"], clock_pins=cfg["library"]["timing_check_clock_pins"],
         allow_missing_timing_checks=cfg["observe"]["allow_missing_timing_checks"],
         sites=cfg["fault_model"]["sites"] or None, cycles_per_shard=inj["cycles_per_shard"],

@@ -75,7 +75,9 @@ SDF `INTERCONNECT` delays can be added as pure transport delays
 
 The SET start time `s` is uniform on `[0, T)` (1-ps resolution), and every
 flip-flop samples at the capture edge `T`. The flip-flop's SDF setup and hold
-checks define its sampling window. A pulse away from fault-free value `b` is
+checks define its sampling window. Where the SDF gives a check several entries
+with a `COND`, a cycle uses the largest of those whose `COND` holds in the
+recorded state, or 0 ps if none holds. A pulse away from fault-free value `b` is
 captured, and the flip-flop latches a wrong value, when the pulse overlaps the
 window:
 

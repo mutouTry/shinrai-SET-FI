@@ -29,12 +29,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .. import _engine
-from ..records import COLUMNS, FORMAT, INF_PS, write_shard
-from .cone import (ConeStats, CapturePlan, PackedCone, build_capture_plan, build_cone,
-                   pack_cone, thresholds)
+from ..records import COLUMNS, FORMAT, INF_PS, WINDOWS_FILE, write_shard, write_windows
+from .cone import ConeStats, CapturePlan, PackedCone, build_capture_plan, build_cone, pack_cone
 from .fastpath import compile_sites
 from .state import read_cycle_bits
 from .substrate import SiteCones, Substrate, load_substrate
+from .windows import campaign_windows
 
 STAT_KEYS = ("applied_events", "canceled_replace", "canceled_back_to_current", "kept_same_target",
              "coalesced_nets", "coalesced_events", "dropped_arc_no_delay", "dropped_no_candidate_arc")
@@ -53,6 +53,7 @@ class CampaignSpec:
     capture_edge_ps: Optional[int] = None     # default: clock period
     sim_horizon_ps: Optional[int] = None      # default: 1.25 x capture edge
     delay_choice: str = "max"                 # "max" | "min" when no changed input has an active path
+    vcs_align: bool = False                   # propagation.vcs_align
     coalesce_window_ps: int = 0
     interconnect: str = "ignore"              # "ignore" | "transport"
     clock_pins: List[str] = field(default_factory=lambda: ["CP", "CK", "CLK"])
@@ -76,7 +77,7 @@ def engine_options(spec: CampaignSpec) -> Dict[str, object]:
 
     simulate_pulses takes the same flags as positional arguments, in this order."""
     return {"sim_end_ps": int(spec.sim_horizon_ps), "eps_ps": int(spec.coalesce_window_ps),
-            "delay_policy_is_max": spec.delay_choice == "max"}
+            "delay_policy_is_max": spec.delay_choice == "max", "vcs_align": bool(spec.vcs_align)}
 
 
 @dataclass
@@ -154,7 +155,7 @@ class _Worker:
                 results = _engine.simulate_pulses(
                     cs.packed, sub.delaytab, net_val, int(cs.src_i), v0, v0 ^ 1, self.pws,
                     int(spec.sim_horizon_ps), int(spec.coalesce_window_ps),
-                    spec.delay_choice == "max")
+                    spec.delay_choice == "max", bool(spec.vcs_align))
                 sidx = self.site_idx[site]
                 for pw, (ev_ptr, ev_t, ev_v, st) in zip(self.pws.tolist(), results):
                     stats["n_sims"] += 1
@@ -328,7 +329,7 @@ def run_campaign(spec: CampaignSpec, log=print) -> Dict:
     site_index = {s: i for i, s in enumerate(sites)}
     os.makedirs(spec.out_dir, exist_ok=True)
     for f in os.listdir(spec.out_dir):          # a previous campaign's files must not survive
-        if f.startswith("records_") or f == "index.json":
+        if f.startswith("records_") or f in ("index.json", WINDOWS_FILE):
             os.remove(os.path.join(spec.out_dir, f))
     log(f"[inject] {len(spec.cycles)} cycles x {len(sites)} sites x {len(spec.pulse_widths_ps)} widths "
         f"= {len(spec.cycles) * len(sites) * len(spec.pulse_widths_ps):,} trials; "
@@ -366,13 +367,20 @@ def run_campaign(spec: CampaignSpec, log=print) -> Dict:
               "trials_reaching_an_observed_ff": stats.get("n_sims_with_records", 0),
               "records": sum(r["shard"]["n_records"] for r in results)}
 
+    win = campaign_windows(sub, spec.stage_dir, spec.state_dir, spec.cycles, spec.clock_pins,
+                           spec.capture_edge_ps, spec.timeprecision_ps)
+    windows = write_windows(os.path.join(spec.out_dir, WINDOWS_FILE), win.exc_cycle, win.exc_ff,
+                            win.exc_enter, win.exc_leave)
+    if win.n_unread_checks:
+        log(f"[inject] {win.n_unread_checks} setup/hold check(s) have a COND that is not made of "
+            f"pin == value terms; they use their first SDF entry in every cycle")
+    T = int(spec.capture_edge_ps)
     ffs = []
-    for ffid in sorted(sub.ffs):
+    for ffid, (e0, e1, l0, l1) in zip(win.ffids.tolist(), win.default.tolist()):
         ff = sub.ffs[ffid]
-        e0, l0, e1, l1 = thresholds(sub, ffid, spec.capture_edge_ps)
         ffs.append({"id": ffid, "inst": ff.inst, "d_net": ff.d_net, "d_pin": ff.d_pin,
-                    "setup_rise_ps": ff.setup_rise_ps, "hold_rise_ps": ff.hold_rise_ps,
-                    "setup_fall_ps": ff.setup_fall_ps, "hold_fall_ps": ff.hold_fall_ps,
+                    "setup_rise_ps": T - l1, "hold_rise_ps": e0 - T,
+                    "setup_fall_ps": T - l0, "hold_fall_ps": e1 - T,
                     "capture_enter_ps": [e0, e1], "capture_leave_ps": [l0, l1]})
 
     index = {
@@ -384,9 +392,10 @@ def run_campaign(spec: CampaignSpec, log=print) -> Dict:
         "n_trials": len(spec.cycles) * len(sites) * len(spec.pulse_widths_ps),
         "sites": sites,
         "ffs": ffs,
+        "windows": windows,
         "shards": [r["shard"] for r in results],
         "propagation": {"horizon_ps": spec.sim_horizon_ps, "delay_choice": spec.delay_choice,
-                        "interconnect": spec.interconnect},
+                        "interconnect": spec.interconnect, "vcs_align": bool(spec.vcs_align)},
         "counts": counts,
         "elapsed_s": round(time.time() - t0, 3),
     }

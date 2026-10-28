@@ -68,7 +68,8 @@ STAGE_KEYS = {
               ("propagation", "sdf_rail")],
     "record": ["workload", "simulator", ("design", "netlist"), ("design", "top")],
     "inject": ["inject", ("propagation", "delay_choice"), ("propagation", "interconnect"),
-               ("propagation", "horizon_factor"), ("design", "clock_period_ns"),
+               ("propagation", "horizon_factor"), ("propagation", "vcs_align"),
+               ("design", "clock_period_ns"),
                ("fault_model", "pulse_widths_ps"), ("fault_model", "sites"),
                ("library", "timing_check_clock_pins"),
                ("observe", "allow_missing_timing_checks")],
@@ -251,6 +252,12 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
                            "SDF INTERCONNECT delays: ignore, or add them as pure delays."),
         "horizon_factor": _k("float", 1.25, "Simulate each SET for this many clock periods "
                                             "(>= 1)."),
+        "vcs_align": _k("bool", False,
+                        "Follow VCS where the SDF leaves a choice, for point-by-point comparisons "
+                        "with an SDF-annotated gate-level simulation: a gate output change whose "
+                        "changed inputs have only inactive COND paths takes zero delay, and a "
+                        "pulse at the D pin from the SET start is captured by a SET that starts "
+                        "at the capture edge."),
     },
     "analyze": {
         "width_models": _k("tables", [{"type": "uniform"}],

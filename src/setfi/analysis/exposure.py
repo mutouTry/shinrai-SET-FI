@@ -11,7 +11,9 @@ probability that the SET of trial k upsets at least one FF is |Omega_k| / T,
 and |{f : s in A_kf}| is the number of FFs upset together (multi-bit upset).
 
 Start times are counted on the 1-ps lattice of the phase domain, which is
-[0, T) by default ("half_open") or [0, T] ("closed", T + 1 points).
+[0, T) by default ("half_open") or [0, T] ("closed", T + 1 points).  With
+propagation.vcs_align, a record whose pulse is at the D pin at the SET start
+(t_enter = 0) also captures for a SET starting at T.
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..records import INF_PS, Records
+from ..records import INF_PS, Records, record_windows
 
 
 def domain_length(period_ps: int, phase_domain: str) -> int:
@@ -32,13 +34,12 @@ def domain_length(period_ps: int, phase_domain: str) -> int:
 
 
 def capture_intervals(cols: Dict[str, np.ndarray], enter: np.ndarray, leave: np.ndarray,
-                      dom: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                      dom: int, exc: Optional[Dict[str, np.ndarray]] = None
+                      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per record: half-open integer interval [lo, hi) of SET start times in
-    [0, dom) that capture.  Returns (row_mask, lo, hi) for the non-empty ones."""
-    base = cols["base"].astype(np.int64)
-    ff = cols["ff"].astype(np.int64)
-    te = enter[base, ff]
-    tl = leave[base, ff]
+    [0, dom) that capture.  Returns (row_mask, lo, hi) for the non-empty ones.
+    ``exc``: the windows that differ by cycle (Records.window_exceptions)."""
+    te, tl = record_windows(cols, enter, leave, exc)
     open_end = cols["t_exit"] >= INF_PS
     lo = np.where(open_end, 0, tl - cols["t_exit"] + 1)
     hi = te - cols["t_enter"]            # s_high + 1
@@ -95,6 +96,8 @@ def accumulate(records: Records, weights: Dict[int, float], phase_domain: str = 
     w_arr = np.asarray([weights[w] for w in widths], dtype=np.float64)
     dom = domain_length(records.period_ps, phase_domain)
     enter, leave = records.thresholds()
+    exc = records.window_exceptions()
+    step_ps = records.capture_edge_ps if records.vcs_align else None
     n_ff = enter.shape[1]
     n_sites = len(records.sites)
     n_w = len(widths)
@@ -111,8 +114,14 @@ def accumulate(records: Records, weights: Dict[int, float], phase_domain: str = 
     for cols in records.shards():
         if cols["cycle"].size == 0:
             continue
-        keep, lo, hi = capture_intervals(cols, enter, leave, dom)
-        if not keep.any():
+        keep, lo, hi = capture_intervals(cols, enter, leave, dom, exc)
+        keep = np.flatnonzero(keep)
+        if step_ps is not None and 0 <= step_ps < dom:
+            step = np.flatnonzero(cols["t_enter"] == 0)
+            keep = np.concatenate([keep, step])
+            lo = np.concatenate([lo, np.full(step.size, step_ps, np.int64)])
+            hi = np.concatenate([hi, np.full(step.size, step_ps + 1, np.int64)])
+        if keep.size == 0:
             continue
         cyc = cols["cycle"][keep]
         ci = _map_cycles(cyc, cyc_list)

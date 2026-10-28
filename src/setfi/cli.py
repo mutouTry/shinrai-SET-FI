@@ -203,7 +203,9 @@ def missing_outputs(cfg, stage: str) -> List[str]:
                                       for c in read_sampled_cycles(os.path.join(d, "cycles.json"))]
         elif stage == "inject":
             with open(os.path.join(d, "index.json")) as f:
-                need = ["index.json"] + [s["file"] for s in json.load(f)["shards"]]
+                idx = json.load(f)
+            need = (["index.json"] + [s["file"] for s in idx["shards"]]
+                    + ([idx["windows"]["file"]] if idx.get("windows") else []))
         elif stage in ("patterns", "logic"):
             need = list(PATTERN_FILES)
     except (OSError, ValueError, KeyError):

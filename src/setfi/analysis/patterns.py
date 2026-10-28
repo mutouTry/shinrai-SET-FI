@@ -62,7 +62,7 @@ from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, Se
 import numpy as np
 
 from .. import _engine
-from ..records import COLUMNS, INF_PS, Records
+from ..records import COLUMNS, INF_PS, Records, record_windows
 
 FORMAT = "setfi-patterns/1"
 
@@ -210,8 +210,10 @@ def compute_patterns(records_or_dir: Union[str, Records], steps: int, jobs: int 
     rec = _records(records_or_dir)
     meta = _metadata(rec, steps)
     enter, leave = rec.thresholds()
+    exc = rec.window_exceptions()
     builder = _engine.PatternBuilder(meta["starts_ps"], enter, leave, meta["cycles"], len(meta["sites"]),
-                                     meta["pulse_widths_ps"], INF_PS)
+                                     meta["pulse_widths_ps"], INF_PS, exc["cycle"], exc["ff"], exc["enter"],
+                                     exc["leave"], rec.capture_edge_ps if rec.vcs_align else -1)
     _for_each_file(rec, builder.add, jobs)
     if builder.n_split_trials:
         _merge_split_trials(rec, builder, jobs)
@@ -239,13 +241,19 @@ def reference_patterns(records_or_dir: Union[str, Records], steps: int) -> Patte
     starts = meta["starts_ps"]
     enter, leave = rec.thresholds()
     cols = rec.load_all()
+    te, tl = record_windows(cols, enter, leave, rec.window_exceptions())
+    step_ps = rec.capture_edge_ps if rec.vcs_align else None
     # F[trial][k]: the FFs that capture for a SET of the trial starting at starts[k]
     F: Dict[tuple, List[set]] = {}
-    for c, s, w, f, b, t_enter, t_exit in zip(*(cols[k].tolist() for k in COLUMNS)):
-        s_high = enter[b, f] - t_enter - 1
-        s_low = -INF_PS if t_exit >= INF_PS else leave[b, f] - t_exit + 1
+    rows = zip(*(cols[k].tolist() for k in COLUMNS), te.tolist(), tl.tolist())
+    for c, s, w, f, b, t_enter, t_exit, enter_f, leave_f in rows:
+        s_high = enter_f - t_enter - 1
+        s_low = -INF_PS if t_exit >= INF_PS else leave_f - t_exit + 1
         sets = F.setdefault((c, s, w), [set() for _ in starts])
-        for k in np.flatnonzero((starts >= s_low) & (starts <= s_high)):
+        hit = (starts >= s_low) & (starts <= s_high)
+        if step_ps is not None and t_enter == 0:
+            hit |= starts == step_ps
+        for k in np.flatnonzero(hit):
             sets[k].add(f)
     # runs: the maximal ranges of k with one non-empty F, by pattern (cycle, F)
     runs: Dict[tuple, List[tuple]] = {}

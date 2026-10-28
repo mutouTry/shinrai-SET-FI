@@ -788,6 +788,7 @@ def build_arc_delays(rows: List[DelayArcRow], inst_to_idx: Dict[str, int], net_t
             "dst_net_idx": resolve_pin_net_idx(inst, dst_pin, pin_to_net, net_to_idx),
             "side_pins": side_pins,
             "default_delay_typ": {"rise": def_r, "fall": def_f},
+            "unconditional": {"rise": bool(default_uncond_r), "fall": bool(default_uncond_f)},
             "patterns": {"rise": patt_rise, "fall": patt_fall},
             "logic_kind": logic_sem.kind if logic_sem else None,
             "clock_pin": logic_sem.clock_pin if logic_sem else None,
@@ -1150,11 +1151,15 @@ def write_delay_table(arcs_obj: List[Dict[str, Any]], path: str, time_precision_
     patt_val = np.zeros(total, dtype=np.int64)
     patt_dt = np.zeros(total, dtype=np.int64)
     patt_is_rise = np.zeros(total, dtype=np.uint8)
+    uncond_rise = np.zeros(n, dtype=np.uint8)     # the arc has an SDF entry without COND
+    uncond_fall = np.zeros(n, dtype=np.uint8)
     p = 0
     for i, arc in enumerate(arcs_obj):
         d0 = arc.get("default_delay_typ") or {}
         default_rise[i] = q_ns_to_ps(d0.get("rise", 0.0), time_precision_ps)
         default_fall[i] = q_ns_to_ps(d0.get("fall", 0.0), time_precision_ps)
+        u = arc.get("unconditional") or {}
+        uncond_rise[i], uncond_fall[i] = bool(u.get("rise")), bool(u.get("fall"))
         patt = arc.get("patterns") or {}
         for is_rise, key in ((1, "rise"), (0, "fall")):
             for entry in (patt.get(key) or []):
@@ -1168,7 +1173,8 @@ def write_delay_table(arcs_obj: List[Dict[str, Any]], path: str, time_precision_
     np.savez(path,
              default_rise_ps=default_rise, default_fall_ps=default_fall,
              patt_ptr=patt_ptr, patt_mask=patt_mask,
-             patt_valbits=patt_val, patt_dt_ps=patt_dt, patt_is_rise=patt_is_rise)
+             patt_valbits=patt_val, patt_dt_ps=patt_dt, patt_is_rise=patt_is_rise,
+             uncond_rise=uncond_rise, uncond_fall=uncond_fall)
     return n, total
 
 

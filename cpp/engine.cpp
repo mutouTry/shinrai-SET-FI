@@ -26,7 +26,11 @@
 //     when the gate, re-evaluated on an input change before the transition
 //     fires, gives the current output value again, so a pulse narrower than
 //     the gate delay dies there;
-//   * optional transport wires (SDF INTERCONNECT) delay but never filter.
+//   * optional transport wires (SDF INTERCONNECT) delay but never filter;
+//   * vcs_align (propagation.vcs_align): an arc with an unconditional SDF entry
+//     is active with that delay when none of its COND entries holds, and when no
+//     changed input has an active path but one has an inactive one, the output
+//     changes with zero delay, as VCS does for state-dependent paths.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
@@ -186,6 +190,7 @@ struct DelayView {
   ArrView<int32_t> patt_ptr;
   ArrView<int64_t> patt_mask, patt_valbits, patt_dt_ps;
   ArrView<uint8_t> patt_is_rise;
+  ArrView<uint8_t> uncond_rise, uncond_fall;  // per arc: an unconditional SDF entry (may be empty)
 };
 
 // per record slot: the (time, new value) of every transition applied to it
@@ -200,7 +205,8 @@ template <typename OnResult>
 static void simulate_pulses_core(const ConeView& cv, const DelayView& dv, const uint8_t* init_p,
                                  int32_t src_i, int32_t v0, int32_t v1,
                                  const int64_t* pw_ps_p, int64_t n_pw, int64_t sim_end_ps, int64_t eps_ps,
-                                 bool delay_policy_is_max, RecEvents& rec_events, OnResult&& on_result) {
+                                 bool delay_policy_is_max, bool vcs_align, RecEvents& rec_events,
+                                 OnResult&& on_result) {
   const ArrView<int32_t>& fanout_ptr = cv.fanout_ptr;
   const ArrView<int32_t>& fanout_idx = cv.fanout_idx;
   const ArrView<int32_t>& gate_out = cv.gate_out;
@@ -227,6 +233,10 @@ static void simulate_pulses_core(const ConeView& cv, const DelayView& dv, const 
   const ArrView<int64_t>& patt_valbits = dv.patt_valbits;
   const ArrView<int64_t>& patt_dt_ps = dv.patt_dt_ps;
   const ArrView<uint8_t>& patt_is_rise = dv.patt_is_rise;
+  auto has_uncond = [&](int32_t dkey_id, int tr_is_rise) -> bool {
+    const ArrView<uint8_t>& u = tr_is_rise ? dv.uncond_rise : dv.uncond_fall;
+    return dkey_id >= 0 && dkey_id < u.n && u.p[dkey_id] != 0;
+  };
 
   const int32_t n_nets = (int32_t)rec_idx.n;
   const int32_t n_gates = (int32_t)gate_out.n;
@@ -533,22 +543,29 @@ static void simulate_pulses_core(const ConeView& cv, const DelayView& dv, const 
           d_used = delay_get_ps(default_rise, default_fall, patt_ptr, patt_mask, patt_valbits,
                                 patt_dt_ps, patt_is_rise, dkey_id, tr_is_rise, sbits_valid, sbits,
                                 active_only);
+          if (d_used < 0 && vcs_align && has_uncond(dkey_id, tr_is_rise))
+            d_used = tr_is_rise ? default_rise.p[dkey_id] : default_fall.p[dkey_id];
           return true;
         };
 
         // Verilog module-path delays: every changed input whose path is active
         // competes, and the smallest delay is used.
-        bool found = false;
+        bool found = false, inactive = false;
         int64_t best_delay = 0;
         for (int32_t j = 0; j < k_in; j++) {
           if (!((changed_mask >> j) & 1)) continue;
           int64_t d_used = 0;
-          if (!arc_delay(j, true, d_used) || d_used < 0) continue;   // no arc, or inactive
+          if (!arc_delay(j, true, d_used)) continue;   // no arc
+          if (d_used < 0) {                            // inactive
+            inactive = true;
+            continue;
+          }
           if (!found || d_used < best_delay) {
             found = true;
             best_delay = d_used;
           }
         }
+        if (!found && inactive && vcs_align) found = true;   // best_delay = 0
 
         // No changed input has an active path: the changed inputs that alone
         // explain the output change (all changed inputs if none does) compete
@@ -686,6 +703,12 @@ static DelayView delay_view_of(const py::object& delaytab_obj, std::vector<py::o
     dv.patt_is_rise = view_1d(a, "patt_is_rise");
     keep.push_back(a);
   }
+  for (auto [name, v] : {std::make_pair("uncond_rise", &dv.uncond_rise), std::make_pair("uncond_fall", &dv.uncond_fall)}) {
+    if (!py::hasattr(delaytab_obj, name) || delaytab_obj.attr(name).is_none()) continue;
+    U8Arr a = as_1d_array<uint8_t>(delaytab_obj.attr(name), name);
+    *v = view_1d(a, name);
+    keep.push_back(a);
+  }
   return dv;
 }
 
@@ -694,7 +717,7 @@ static DelayView delay_view_of(const py::object& delaytab_obj, std::vector<py::o
 static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
                                 U8Arr net_val_init_u8, int32_t src_i, int32_t v0, int32_t v1,
                                 I64Arr pw_ps_array, int64_t sim_end_ps, int64_t eps_ps,
-                                bool delay_policy_is_max) {
+                                bool delay_policy_is_max, bool vcs_align) {
   std::vector<py::object> keep;
   const ConeView cv = cone_view_of_packed(packed_obj, keep);
   const DelayView dv = delay_view_of(delaytab_obj, keep);
@@ -714,7 +737,7 @@ static py::list simulate_pulses(py::object packed_obj, py::object delaytab_obj,
   py::list result;
   RecEvents rec_events;
   simulate_pulses_core(cv, dv, init_p, src_i, v0, v1, pw_ps_p, n_pw, sim_end_ps, eps_ps,
-                       delay_policy_is_max, rec_events, [&](int64_t, const SimStats& stats) {
+                       delay_policy_is_max, vcs_align, rec_events, [&](int64_t, const SimStats& stats) {
     // flatten the recorded events (CSR over record slots)
     const int32_t n_rec_slots = (int32_t)rec_events.size();
     I32Arr ev_ptr({(py::ssize_t)(n_rec_slots + 1)});
@@ -838,10 +861,11 @@ struct EngineOptions {
   int64_t sim_end_ps = 0;
   int64_t eps_ps = 0;
   bool delay_policy_is_max = true;
+  bool vcs_align = false;
 };
 
 static EngineOptions engine_options_from(const py::dict& d) {
-  static const char* const keys[] = {"sim_end_ps", "eps_ps", "delay_policy_is_max"};
+  static const char* const keys[] = {"sim_end_ps", "eps_ps", "delay_policy_is_max", "vcs_align"};
   for (auto kv : d) {
     const std::string k = py::cast<std::string>(kv.first);
     if (std::find_if(std::begin(keys), std::end(keys), [&](const char* x) { return k == x; }) == std::end(keys))
@@ -855,6 +879,7 @@ static EngineOptions engine_options_from(const py::dict& d) {
   o.sim_end_ps = py::cast<int64_t>(need("sim_end_ps"));
   o.eps_ps = py::cast<int64_t>(need("eps_ps"));
   o.delay_policy_is_max = py::cast<bool>(need("delay_policy_is_max"));
+  o.vcs_align = py::cast<bool>(need("vcs_align"));
   return o;
 }
 
@@ -999,7 +1024,7 @@ static py::dict run_block(py::list cones_list,
           const int32_t v0 = (int32_t)(o.net_val[(size_t)c.src_i] & 1);
           simulate_pulses_core(
               cv, dv, o.net_val.data(), c.src_i, v0, v0 ^ 1, pws, n_pw, opt.sim_end_ps, opt.eps_ps,
-              opt.delay_policy_is_max, o.rec_events, [&](int64_t pw_idx, const SimStats& st) {
+              opt.delay_policy_is_max, opt.vcs_align, o.rec_events, [&](int64_t pw_idx, const SimStats& st) {
             S[ST_N_SIMS] += 1;
             S[ST_APPLIED] += st.applied_events;
             S[ST_C_REPLACE] += st.canceled_replace;
@@ -1148,7 +1173,7 @@ PYBIND11_MODULE(_engine, m) {
   m.def("simulate_pulses", &simulate_pulses, py::arg("packed"), py::arg("delaytab"),
         py::arg("net_val_init_u8"), py::arg("src_i"), py::arg("v0"), py::arg("v1"),
         py::arg("pw_ps_array"), py::arg("sim_end_ps"), py::arg("eps_ps"),
-        py::arg("delay_policy_is_max"),
+        py::arg("delay_policy_is_max"), py::arg("vcs_align") = false,
         R"doc(Inject one SET per pulse width on net src_i (flip v0 -> v1 at t=0,
 back to v0 at t=pw) and propagate it through the packed cone until sim_end_ps.
 
@@ -1157,7 +1182,7 @@ together with it (coalesce_window_ps; 0: only simultaneous events).
 delay_policy_is_max: when several inputs of a gate change at once and none has
 an active delay path, use the largest (True) or smallest default delay of the
 inputs that explain the output change (propagation.delay_choice; see
-docs/MODEL.md).
+docs/MODEL.md).  vcs_align: propagation.vcs_align.
 
 Returns a list with one (ev_ptr, ev_t, ev_v, stats) tuple per pulse width:
 ev_ptr is a CSR pointer over record slots, ev_t / ev_v the time (ps) and new
@@ -1178,8 +1203,8 @@ simulation stops gets t_exit = inf_ps.  Returns (dp_index, t_enter, t_exit).)doc
         R"doc(All trials of a block of cycles: for every cone (a CompiledCone), every
 cycle (row of states, one byte per global net) and every pulse width, bind the
 state, propagate, and collect the pulse records.  options holds the propagation
-flags, the trailing arguments of simulate_pulses by name: sim_end_ps, eps_ps
-and delay_policy_is_max.
+flags, the trailing arguments of simulate_pulses by name: sim_end_ps, eps_ps,
+delay_policy_is_max and vcs_align.
 
 Returns a dict: the record columns (cycle, site, width_ps, ff, base, t_enter,
 t_exit) in the order of a cycle-major loop over (cycle, cone, width);

@@ -68,6 +68,8 @@ class DelayTable:
     patt_valbits: np.ndarray
     patt_dt_ps: np.ndarray
     patt_is_rise: np.ndarray
+    uncond_rise: Optional[np.ndarray] = None    # per arc: an SDF entry without COND
+    uncond_fall: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -253,6 +255,8 @@ def load_delay_table(path: str) -> DelayTable:
         patt_valbits=d["patt_valbits"].astype(np.int64),
         patt_dt_ps=d["patt_dt_ps"].astype(np.int64),
         patt_is_rise=d["patt_is_rise"].astype(np.uint8),
+        uncond_rise=d["uncond_rise"].astype(np.uint8) if "uncond_rise" in d else None,
+        uncond_fall=d["uncond_fall"].astype(np.uint8) if "uncond_fall" in d else None,
     )
 
 
@@ -307,11 +311,12 @@ def _check_value(ent: Dict[str, Any]) -> Optional[float]:
     return None
 
 
-def setup_hold_ns(checks_by_ff: Dict[str, Any], ff_inst: str, data_edge: str, d_pin: str,
-                  clock_pins: List[str]) -> Optional[Tuple[float, float]]:
-    """(setup, hold) in ns for a ``data_edge`` ('posedge' / 'negedge') on ``d_pin``,
-    against the first listed clock pin that has both checks.  A check written without
-    a data edge in the SDF applies to both data edges."""
+def check_group(checks_by_ff: Dict[str, Any], ff_inst: str, data_edge: str, d_pin: str,
+                clock_pins: List[str]) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+    """The SETUP and HOLD entries ({"SETUP": [...], "HOLD": [...]}, in SDF order) for a
+    ``data_edge`` ('posedge' / 'negedge') on ``d_pin``, against the first listed clock
+    pin that has both checks.  A check written without a data edge in the SDF applies
+    to both data edges."""
     ent = checks_by_ff.get(ff_inst)
     if not isinstance(ent, dict):
         return None
@@ -332,14 +337,22 @@ def setup_hold_ns(checks_by_ff: Dict[str, Any], ff_inst: str, data_edge: str, d_
             continue
         for pin in clock_pins:
             for ref in (f"posedge:{pin}", f"negedge:{pin}", pin):
-                v = pair(dd.get(ref))
-                if v is not None:
-                    return v
+                if pair(dd.get(ref)) is not None:
+                    return dd[ref]
         # none of the listed clock pins: use the reference pin if exactly one has both checks
-        found = {ref: pair(cp) for ref, cp in dd.items() if pair(cp) is not None}
+        found = {ref: cp for ref, cp in dd.items() if pair(cp) is not None}
         if len({r.split(":")[-1] for r in found}) == 1:
             return next(iter(found.values()))
     return None
+
+
+def setup_hold_ns(checks_by_ff: Dict[str, Any], ff_inst: str, data_edge: str, d_pin: str,
+                  clock_pins: List[str]) -> Optional[Tuple[float, float]]:
+    """(setup, hold) in ns of the first listed entries of ``check_group``."""
+    cp = check_group(checks_by_ff, ff_inst, data_edge, d_pin, clock_pins)
+    if cp is None:
+        return None
+    return float(_check_value(cp["SETUP"][0])), float(_check_value(cp["HOLD"][0]))
 
 
 def load_ff_thresholds(stage_dir: str, *, clock_pins: List[str], allow_missing: bool = False,

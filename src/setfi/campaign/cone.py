@@ -356,19 +356,6 @@ def pack_cone(cone: Cone, dkey2id: Dict[str, int]) -> PackedCone:
                       wire_rise_ps=w_rise, wire_fall_ps=w_fall)
 
 
-def thresholds(sub: Substrate, ffid: int, capture_edge_ps: int) -> Tuple[int, int, int, int]:
-    """(enter0, leave0, enter1, leave1): a pulse away from fault-free value
-    ``base`` overlaps the FF's sampling window iff it is present at the D pin at
-    some time in (leave_base, enter_base).  base 0 means the pulse is a 0->1->0
-    excursion: it enters with a rising D and leaves with a falling D."""
-    ff = sub.ffs[ffid]
-    enter0 = capture_edge_ps + ff.hold_rise_ps
-    leave0 = capture_edge_ps - ff.setup_fall_ps
-    enter1 = capture_edge_ps + ff.hold_fall_ps
-    leave1 = capture_edge_ps - ff.setup_rise_ps
-    return enter0, leave0, enter1, leave1
-
-
 def build_capture_plan(sub: Substrate, cone: Cone, stats: ConeStats) -> CapturePlan:
     reachable = sub.skeleton[cone.src_net]["reachable_dnets"]
     dn_to_ffids: Dict[str, List[int]] = {}

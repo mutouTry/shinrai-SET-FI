@@ -41,11 +41,13 @@ the other stages refer to these numbers.
 
 ## inject/
 
-`index.json` (format `setfi-records/1`) describes the campaign:
+`index.json` (format `setfi-records/2`) describes the campaign:
 `clock_period_ps`, `pulse_widths_ps`, `cycles`, `sites` (site index to net
 name), `ffs` (flip-flop id, instance, data net, setup and hold,
-`capture_enter_ps` and `capture_leave_ps`), `shards` (the record files),
-`propagation` (settings used) and `counts`.
+`capture_enter_ps` and `capture_leave_ps` in most cycles), `windows` (the file
+`windows.npz`), `shards` (the record files), `propagation` (settings used) and
+`counts`. `windows.npz` lists the cycles in which a flip-flop's window differs:
+`cycle`, `ff`, and `enter`, `leave` of shape [n, 2] by `base`.
 
 `records_c<i>_s<j>.npz` hold the pulse records of block `i` of the sampled
 cycles (`inject.cycles_per_shard` cycles each) and slice `j` of the sites (one
