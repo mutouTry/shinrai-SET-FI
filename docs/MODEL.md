@@ -57,6 +57,13 @@ the inputs that alone explain the output change (all changed inputs if none
 does) compete with their default delays, and `propagation.delay_choice` picks
 the largest (default) or the smallest.
 
+An arc without an SDF delay passes no pulse: a change of its input does not
+reach the output through it. The build accepts such arcs inside the fan-out
+cones only with `build.allow_missing_delays`, and `build_manifest.json` and
+`inject` count them. The enable arc of a three-state output may be given only
+by its transitions to and from Z; [CELLS.md](CELLS.md#three-state-outputs)
+gives the rise and fall it takes from them.
+
 ### Inertial filtering
 
 Each net holds at most one pending transition. If an input changes before the

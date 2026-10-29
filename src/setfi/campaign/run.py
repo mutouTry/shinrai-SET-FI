@@ -33,7 +33,7 @@ from ..records import COLUMNS, FORMAT, INF_PS, WINDOWS_FILE, write_shard, write_
 from .cone import ConeStats, CapturePlan, PackedCone, build_capture_plan, build_cone, pack_cone
 from .fastpath import compile_sites
 from .state import read_cycle_bits
-from .substrate import SiteCones, Substrate, load_substrate
+from .substrate import SiteCones, Substrate, cone_arcs_without_delay, load_substrate
 from .windows import campaign_windows
 
 STAT_KEYS = ("applied_events", "canceled_replace", "canceled_back_to_current", "kept_same_target",
@@ -334,6 +334,10 @@ def run_campaign(spec: CampaignSpec, log=print) -> Dict:
     log(f"[inject] {len(spec.cycles)} cycles x {len(sites)} sites x {len(spec.pulse_widths_ps)} widths "
         f"= {len(spec.cycles) * len(sites) * len(spec.pulse_widths_ps):,} trials; "
         f"{sub.counts['n_ff_observed']} observed FFs; T = {spec.clock_period_ps} ps")
+    n_no_delay, n_no_delay_sites = cone_arcs_without_delay(sub, sites)
+    if n_no_delay:
+        log(f"[inject] {n_no_delay} gate arc(s) in the cones of {n_no_delay_sites} site(s) have no "
+            f"delay (build.allow_missing_delays): pulses do not pass them")
 
     blocks = [(b, spec.cycles[i:i + spec.cycles_per_shard])
               for b, i in enumerate(range(0, len(spec.cycles), spec.cycles_per_shard))]
@@ -366,6 +370,8 @@ def run_campaign(spec: CampaignSpec, log=print) -> Dict:
     counts = {"trials": stats.get("n_sims", 0),
               "trials_reaching_an_observed_ff": stats.get("n_sims_with_records", 0),
               "records": sum(r["shard"]["n_records"] for r in results)}
+    if n_no_delay:
+        counts["arcs_without_delay"] = n_no_delay
 
     win = campaign_windows(sub, spec.stage_dir, spec.state_dir, spec.cycles, spec.clock_pins,
                            spec.capture_edge_ps, spec.timeprecision_ps)

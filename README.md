@@ -41,8 +41,10 @@ The `record` stage needs Icarus Verilog, VCS or another Verilog simulator
   hierarchical, and `assign` statements between nets are treated as connections.
   Escaped identifiers are not supported.
 * **SDF** for that netlist: an `IOPATH` delay (with or without `COND`) for every
-  gate arc a pulse can traverse, `SETUP` and `HOLD` (or `SETUPHOLD`) checks for
-  every observed flip-flop, and optionally `INTERCONNECT`.
+  gate arc a pulse can traverse (for the enable of a three-state output, its
+  transitions to and from Z suffice: [docs/CELLS.md](docs/CELLS.md)), `SETUP`
+  and `HOLD` (or `SETUPHOLD`) checks for every observed flip-flop, and
+  optionally `INTERCONNECT`.
 * **Cell functions**: a Liberty file, or Verilog cell modules
   ([docs/CELLS.md](docs/CELLS.md)).
 * **Testbench**: instantiates the design, runs it with a clock (and usually a

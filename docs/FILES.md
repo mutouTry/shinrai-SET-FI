@@ -22,12 +22,12 @@ the other stages refer to these numbers.
 | `site_cones.jsonl` | one line per injection site: its net, the nets of its fan-out cone in topological order, the gate arcs between them, the flip-flop data nets it reaches |
 | `edges.json` | one entry per gate arc: instance, input pin, output pin, nets |
 | `pin_to_net.json` | instance pin to net |
-| `cell_arcs.json` | per cell arc: output function, side inputs, truth table, side-input values that let a change pass |
+| `cell_arcs.json` | per cell arc (every gate arc whose output depends on its input, with or without an SDF delay): output function, side inputs, truth table, side-input values that let a change pass |
 | `timing_checks.json` | per flip-flop: its SDF setup and hold (and recovery, removal) checks |
 | `delay_table.npz`, `arc_index.json` | rise and fall delay of every instance arc, with its SDF `COND` alternatives. `arc_index.json` gives each arc's row |
 | `interconnect.json` | only if the SDF has `INTERCONNECT`: wire delay per load pin |
 | `cell_functions.v` | only for Liberty (or several) `library.cell_functions`: the cells as Verilog modules |
-| `build_manifest.json` | input checksums, counts, check results, and SDF entries that are not used, by reason |
+| `build_manifest.json` | input checksums, counts, check results, and SDF entries that are not used, by reason. With `build.allow_missing_delays`, `arcs_without_delay` counts the gate arcs inside the fan-out cones that have no SDF delay (only if there are any) |
 | `intermediate/` | only with `build.keep_intermediates` |
 
 ## record/
@@ -46,7 +46,9 @@ the other stages refer to these numbers.
 name), `ffs` (flip-flop id, instance, data net, setup and hold,
 `capture_enter_ps` and `capture_leave_ps` in most cycles), `windows` (the file
 `windows.npz`), `shards` (the record files), `propagation` (settings used) and
-`counts`. `windows.npz` lists the cycles in which a flip-flop's window differs:
+`counts`. `counts.arcs_without_delay` is there only if the sites' cones hold
+gate arcs without a delay, which pulses do not pass. `windows.npz` lists the
+cycles in which a flip-flop's window differs:
 `cycle`, `ff`, and `enter`, `leave` of shape [n, 2] by `base`.
 
 `records_c<i>_s<j>.npz` hold the pulse records of block `i` of the sampled

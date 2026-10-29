@@ -23,7 +23,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -463,3 +463,28 @@ def load_substrate(stage_dir: str, *, clock_pins: List[str], interconnect: str =
                      counts={"n_ff_observed": len(ffs), "n_sites": len(skeleton),
                              "n_nets": len(idx_to_net), "n_arcs": len(dkey2id),
                              "n_wires": len(wire_lut)})
+
+
+def cone_arcs_without_delay(sub: Substrate, sites: Sequence[str]) -> Tuple[int, int]:
+    """The gate arcs in the fan-out cones of ``sites`` that have no delay, and the
+    number of those sites whose cone holds one.  The build accepts such arcs only
+    with build.allow_missing_delays; pulses do not pass them."""
+    no_delay = [eid for eid, e in sub.edges.items() if e.delay_key not in sub.dkey2id]
+    if not no_delay or not sites:
+        return 0, 0
+    skel = sub.skeleton
+    if isinstance(skel, SiteCones):
+        a = skel.arrays
+        pos = np.flatnonzero(np.isin(a["eids"], np.asarray(no_delay, dtype=np.int64)))
+        entry = np.searchsorted(a["adj_eptr"], pos, side="right") - 1    # cone_adj entry of each eid
+        row = np.searchsorted(a["adj_ptr"], entry, side="right") - 1     # site row of each entry
+        keep = np.isin(row, np.asarray([skel.row(s) for s in sites], dtype=np.int64))
+        return int(np.unique(a["eids"][pos[keep]]).size), int(np.unique(row[keep]).size)
+    nd = set(no_delay)
+    found: set = set()
+    n_sites = 0
+    for s in sites:
+        hit = {int(eid) for _u, eids in skel[s]["cone_adj"] for eid in eids if int(eid) in nd}
+        found |= hit
+        n_sites += bool(hit)
+    return len(found), n_sites

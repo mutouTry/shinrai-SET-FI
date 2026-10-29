@@ -230,12 +230,13 @@ def _build(spec: BuildSpec, out_dir: str) -> Dict[str, Any]:
         mirror_scan_data_checks=lspec.mirror_scan_data_checks,
         scan_data_pin_pairs=lspec.scan_data_pin_pairs)
     tres = timing.compile_stage(sdf, funcs, g.inst_to_idx, g.net_to_idx, g.pin_to_net,
-                                out_dir, opts, intermediate_dir=inter_dir)
+                                out_dir, opts, intermediate_dir=inter_dir,
+                                graph_arcs={(e.celltype, e.inpin, e.outpin) for e in g.edges})
     log.info("timing: %d arcs, %d checks, %d interconnect rows", tres["n_arcs"],
              tres["n_timing_checks"], tres["n_interconnect"])
 
     # every gate arc a pulse can traverse needs an SDF delay: without one the pulse
-    # cannot pass that arc at all
+    # cannot pass that arc at all (build.allow_missing_delays accepts this)
     with open(os.path.join(out_dir, "arc_index.json")) as fh:
         arc_keys = set(json.load(fh).get("delay_key_to_arc_idx", {}))
     no_delay: Dict[Tuple[str, str, str], List[str]] = {}
@@ -243,14 +244,14 @@ def _build(spec: BuildSpec, out_dir: str) -> Dict[str, Any]:
         e = g.edges[eid]
         if e.delay_key not in arc_keys:
             no_delay.setdefault((e.celltype, e.inpin, e.outpin), []).append(e.inst)
+    n_no_delay = sum(len(v) for v in no_delay.values())
     if no_delay:
         items = sorted(no_delay.items(), key=lambda kv: -len(kv[1]))
         desc = "; ".join(f"{ct} {a}->{z} ({len(insts)} instance(s), e.g. {insts[0]})"
                          for (ct, a, z), insts in items[:5])
-        msg = (f"{sum(len(v) for v in no_delay.values())} gate arc(s) inside injection cones "
-               f"have no SDF IOPATH delay: {desc}")
+        msg = f"{n_no_delay} gate arc(s) inside injection cones have no SDF IOPATH delay: {desc}"
         if spec.allow_missing_delays:
-            warnings.append(msg + "; pulses cannot pass these arcs")
+            warnings.append(msg + "; pulses do not pass these arcs (build.allow_missing_delays)")
         else:
             raise BuildError(msg + ". Add them to the SDF, or set build.allow_missing_delays "
                              "= true to let pulses stop at these arcs.")
@@ -305,6 +306,13 @@ def _build(spec: BuildSpec, out_dir: str) -> Dict[str, Any]:
         "warnings": warnings,
         "elapsed_s": round(time.time() - t0, 3),
     }
+    if no_delay:      # accepted with build.allow_missing_delays
+        manifest["arcs_without_delay"] = {
+            "about": "gate arcs inside injection cones without an SDF delay; pulses do not "
+                     "pass them",
+            "n_arcs": n_no_delay,
+            "by_cell_arc": {f"{ct}:{a}->{z}": len(v) for (ct, a, z), v in sorted(no_delay.items())},
+        }
     _dump(manifest, os.path.join(out_dir, MANIFEST_NAME), indent=2, ensure_ascii=False)
     for w in warnings:
         log.warning("%s", w)

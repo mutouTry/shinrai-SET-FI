@@ -310,7 +310,8 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
         "keep_intermediates": _k("bool", False, "Keep intermediate files in build/intermediate/."),
         "allow_missing_delays": _k("bool", False,
                                    "Accept gate arcs without an SDF delay inside injection cones "
-                                   "(pulses cannot pass them) instead of failing."),
+                                   "(pulses cannot pass them) instead of failing. The build "
+                                   "manifest and inject count them."),
     },
 }
 

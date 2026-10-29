@@ -13,6 +13,9 @@ Reads the SDF once and produces, keyed to the net and instance indices:
 SDF dialects: DC (OVI 2.1, ``(min:typ:max)``, split SETUP/HOLD) and Innovus
 (SDF 3.0, ``(min::max)``, merged SETUPHOLD/RECREM) are both accepted and normalised;
 Any TIMESCALE from the header is converted; a DIVIDER of ``.`` is converted to ``/``.
+An IOPATH's rise and fall are its 01 and 10 values; an IOPATH that gives only
+transitions to and from Z (a three-state enable) takes them from those values and
+the cell function (``resolve_three_state``).
 """
 from __future__ import annotations
 
@@ -23,7 +26,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
 from statistics import median
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -311,6 +314,10 @@ class DelayArcRow:
     cond_expr: Optional[str]
     rise: Optional[Triplet]
     fall: Optional[Triplet]
+    # A row with no 01 and no 10 value but values for transitions to or from Z
+    # (keys "0Z", "Z1", "1Z", "Z0"): rise and fall stay None until
+    # resolve_three_state takes them from these values and the cell function.
+    three_state: Optional[Dict[str, Triplet]] = None
 
 
 @dataclass
@@ -398,27 +405,51 @@ def parse_delay_list_opt(lst: Any) -> Optional[Triplet]:
     return parse_triplet_atom(str(lst[0]))
 
 
+def _three_state_values(values: List[Any]) -> Dict[str, Triplet]:
+    """The transitions to and from Z that an IOPATH value list gives (SDF 3.0):
+    3 values are 01 10 Z, where Z is both 0Z and 1Z; 6 or 12 values begin with
+    01 10 0Z Z1 1Z Z0.  Empty lists are left out."""
+    if len(values) == 3:
+        z = parse_delay_list_opt(values[2])
+        return {} if z is None else {"0Z": z, "1Z": z}
+    if len(values) >= 6:
+        out = {}
+        for key, lst in zip(("0Z", "Z1", "1Z", "Z0"), values[2:6]):
+            v = parse_delay_list_opt(lst)
+            if v is not None:
+                out[key] = v
+        return out
+    return {}
+
+
 def _emit_iopath(out: List[DelayArcRow], celltype: str, inst: str,
-                 cond_expr: Optional[str], iopath: List[Any]) -> None:
+                 cond_expr: Optional[str], iopath: List[Any],
+                 notes: Optional[Counter] = None) -> None:
     if len(iopath) < 4:
         return
     src_ep = split_iopath_endpoint(iopath[1])
     dst_ep = split_iopath_endpoint(iopath[2])
+    three_state = None
     try:
         if len(iopath) == 4:
             one = parse_delay_list_opt(iopath[3])
             rise, fall = one, one
         else:
             rise, fall = parse_delay_list_opt(iopath[3]), parse_delay_list_opt(iopath[4])
+        if rise is None and fall is None:
+            # e.g. the enable arc of a three-state output: (IOPATH OE Z () () 0Z Z1 1Z Z0)
+            three_state = _three_state_values(iopath[3:]) or None
     except Exception:   # noqa: BLE001
         return
-    if rise is None and fall is None:
+    if rise is None and fall is None and three_state is None:
         return
+    if three_state is not None and notes is not None:
+        notes["iopath_three_state_values_only"] += 1
     out.append(DelayArcRow(
         celltype=celltype, inst=inst,
         src_pin=src_ep.pin, src_edge=src_ep.edge,
         dst_pin=dst_ep.pin, cond_expr=cond_expr,
-        rise=rise, fall=fall,
+        rise=rise, fall=fall, three_state=three_state,
     ))
 
 
@@ -632,11 +663,11 @@ def _read_sdf_tree(tree: Any, header: Dict[str, str]) -> SdfData:
                         cond_expr = normalize_space(
                             " ".join(flatten_tokens(x) for x in item[1:-1]))
                         if isinstance(iopath, list) and iopath and iopath[0] == "IOPATH":
-                            _emit_iopath(arcs, celltype, inst, cond_expr, iopath)
+                            _emit_iopath(arcs, celltype, inst, cond_expr, iopath, notes)
                         else:
                             notes["delay_cond_without_iopath"] += 1
                     elif head == "IOPATH":
-                        _emit_iopath(arcs, celltype, inst, None, item)
+                        _emit_iopath(arcs, celltype, inst, None, item, notes)
                     else:
                         notes[f"delay_item_unhandled:{head}"] += 1
         if instance_scoped:
@@ -650,6 +681,45 @@ def _read_sdf_tree(tree: Any, header: Dict[str, str]) -> SdfData:
 # ============================================================
 # arc delays
 # ============================================================
+def resolve_three_state(rows: List[DelayArcRow], funcs: CellFunctions,
+                        stats: Stats) -> List[DelayArcRow]:
+    """Rise and fall delays of the rows that give only transitions to and from Z.
+
+    The cell function describes a three-state output by the value its net takes:
+    with the driver off, the value p of the pull on the net, e.g. p = 1 for
+    ``Z = OE ? I : 1'b1`` (``CellFunctions.released_value``).  Through such an arc
+    the output only moves between p (driver off) and the driven value 1 - p:
+
+        output changes to p      the driver turns off   (1-p)Z: 0Z if p = 1, 1Z if p = 0
+        output changes to 1 - p  the driver turns on    Z(1-p): Z0 if p = 1, Z1 if p = 0
+
+    Rise is the change to 1 and fall the change to 0.  A Verilog simulator does the
+    same with these SDF values and a pull on the net: the net follows the driver to
+    Z after the turn-off delay and the pull gives it its value at that instant.
+
+    A row is dropped (its arc has no delay, see build.allow_missing_delays) if its
+    cell function has no such p or if the SDF gives neither of the two values."""
+    out: List[DelayArcRow] = []
+    for r in rows:
+        if r.three_state is None:
+            out.append(r)
+            continue
+        arc = f"{r.inst}:{r.src_pin}->{r.dst_pin}"
+        p = funcs.released_value(r.celltype, r.src_pin, r.dst_pin)
+        if p is None:
+            stats.hit("sdf_three_state_arc_without_released_value", arc)
+            continue
+        tz = r.three_state
+        rise, fall = (tz.get("0Z"), tz.get("Z0")) if p == 1 else (tz.get("Z1"), tz.get("1Z"))
+        if rise is None and fall is None:
+            stats.hit("sdf_three_state_arc_without_needed_values", arc)
+            continue
+        out.append(DelayArcRow(celltype=r.celltype, inst=r.inst, src_pin=r.src_pin,
+                               src_edge=r.src_edge, dst_pin=r.dst_pin, cond_expr=r.cond_expr,
+                               rise=rise, fall=fall))
+    return out
+
+
 def select_side_pins(rows: List[DelayArcRow], logic_side_pins: List[str],
                      opts: TimingOptions) -> List[str]:
     freq: Counter = Counter()
@@ -1199,12 +1269,14 @@ def _dump(obj: Any, path: str, indent: Optional[int] = None) -> None:
 
 def compile_stage(sdf: SdfData, funcs: CellFunctions, inst_to_idx: Dict[str, int],
                   net_to_idx: Dict[str, int], pin_to_net: Dict[str, str], out_dir: str,
-                  opts: TimingOptions, intermediate_dir: Optional[str] = None
-                  ) -> Dict[str, Any]:
+                  opts: TimingOptions, intermediate_dir: Optional[str] = None,
+                  graph_arcs: Iterable[Tuple[str, str, str]] = ()) -> Dict[str, Any]:
     """Write cell arcs, timing checks, interconnect, delay_table.npz and arc_index.json into
-    ``out_dir`` (arc delays into ``intermediate_dir`` when given).  Returns counts/diagnostics."""
+    ``out_dir`` (arc delays into ``intermediate_dir`` when given).  ``graph_arcs``: the
+    (cell, input pin, output pin) of the gate arcs of the graph.  Returns counts/diagnostics."""
     stats = Stats()
-    arc_delays = build_arc_delays(sdf.arcs, inst_to_idx, net_to_idx, pin_to_net, funcs, stats, opts)
+    arcs = resolve_three_state(sdf.arcs, funcs, stats)
+    arc_delays = build_arc_delays(arcs, inst_to_idx, net_to_idx, pin_to_net, funcs, stats, opts)
     arcs_obj = arc_delays["arcs"]
     if intermediate_dir:
         _dump(arc_delays, os.path.join(intermediate_dir, "arc_delays.json"), indent=2)
@@ -1212,7 +1284,11 @@ def compile_stage(sdf: SdfData, funcs: CellFunctions, inst_to_idx: Dict[str, int
     n_arcs, n_patterns = write_delay_table(arcs_obj, os.path.join(out_dir, "delay_table.npz"),
                                            opts.time_precision_ps)
 
-    needed = {(r.celltype, r.src_pin, r.dst_pin) for r in sdf.arcs}
+    # Every gate arc whose output depends on its input gets its truth table, also when
+    # the SDF has no delay for it: a gate is evaluated from the table of any of its
+    # arcs that a pulse reaches.
+    needed = {(r.celltype, r.src_pin, r.dst_pin) for r in arcs}
+    needed |= {a for a in graph_arcs if a not in needed and funcs.arc(*a) is not None}
     cell_arcs = build_cell_arcs(needed, funcs, stats, opts)
     n_side_checked = assert_side_pin_bases_agree(arcs_obj, cell_arcs, stats)
     _dump(cell_arcs, os.path.join(out_dir, "cell_arcs.json"), indent=2)
@@ -1223,7 +1299,7 @@ def compile_stage(sdf: SdfData, funcs: CellFunctions, inst_to_idx: Dict[str, int
 
     interconnect = None
     if sdf.ics:
-        interconnect = build_interconnect(sdf.ics, sdf.arcs, sdf.tcs, sdf.inst_celltype,
+        interconnect = build_interconnect(sdf.ics, arcs, sdf.tcs, sdf.inst_celltype,
                                    pin_to_net, net_to_idx, stats, opts)
         _dump(interconnect, os.path.join(out_dir, "interconnect.json"), indent=2)
 

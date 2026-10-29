@@ -82,6 +82,22 @@ class ConeStats:
         self.dnets_without_observed_ff = 0
 
 
+def _output_function(sub: Substrate, arcmap: Dict[str, Dict[str, str]],
+                     outpin: str) -> Optional[Dict]:
+    """The cell_arcs entry of another input of the same cell output (the first by
+    key), or None.  Every entry of an output holds that output's truth table."""
+    index = sub.__dict__.get("_entry_of_output")
+    if index is None:
+        index = {}
+        for k in sorted(sub.cell_arcs):
+            ent = sub.cell_arcs[k]
+            if isinstance(ent, dict) and ent.get("kind") == "comb":
+                index.setdefault((ent.get("celltype"), ent.get("dst")), ent)
+        sub.__dict__["_entry_of_output"] = index
+    celltype = next(iter(arcmap.values()))["celltype"]
+    return index.get((celltype, outpin))
+
+
 def build_cone(sub: Substrate, src_net: str, stats: ConeStats) -> Cone:
     src_obj = sub.skeleton[src_net]
     topo_nets: List[str] = list(src_obj["cone_topo_nets"])
@@ -105,7 +121,7 @@ def build_cone(sub: Substrate, src_net: str, stats: ConeStats) -> Cone:
                 gate_key_to_gid[gkey] = gid
                 gate_inpin_arcs.append({})
             gate_inpin_arcs[gid][e.inpin] = {"in_net": e.src_net, "delay_key": e.delay_key,
-                                             "mask_key": e.mask_key}
+                                             "mask_key": e.mask_key, "celltype": e.celltype}
             fanout_by_net[e.src_net].append(gid)
 
     gid_to_gkey: List[Tuple[str, str, str]] = [("", "", "")] * len(gate_key_to_gid)
@@ -115,9 +131,17 @@ def build_cone(sub: Substrate, src_net: str, stats: ConeStats) -> Cone:
     all_nets = set(topo_nets)
     gate_build = []
     for gid, arcmap in enumerate(gate_inpin_arcs):
-        inst, _outpin, out_net = gid_to_gkey[gid]
+        inst, outpin, out_net = gid_to_gkey[gid]
         mask_keys = [d["mask_key"] for d in arcmap.values()]
         ent = next((cell_arcs[mk] for mk in mask_keys if isinstance(cell_arcs.get(mk), dict)), None)
+        if ent is None:
+            # the in-cone arcs have no entry (e.g. a build that wrote entries only for the
+            # arcs with an SDF delay): the output's function from another arc of the cell
+            ent = _output_function(sub, arcmap, outpin)
+        if ent is None and not any(d["delay_key"] in sub.dkey2id for d in arcmap.values()):
+            # Reached only through arcs without a delay (build.allow_missing_delays): no
+            # pulse passes them, so the output keeps its value and the gate is left out.
+            continue
         if ent is None:
             raise SubstrateError(
                 f"cell function missing for instance {inst} (output net {out_net}, arcs "

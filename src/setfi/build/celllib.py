@@ -693,6 +693,41 @@ class CellFunctions:
         self._memo[key] = sem
         return sem
 
+    def released_value(self, celltype: str, src_pin: str, dst_pin: str) -> Optional[int]:
+        """The value of a three-state output when the arc's input turns its driver off.
+
+        The model of a three-state output gives the value the net takes when the
+        driver is off, e.g. ``Z = OE ? I : 1'b1`` for a pulled-up net.  The input
+        releases the output at the one value of that input for which the output no
+        longer depends on the other inputs, and the output is then a constant: that
+        constant is returned.  None if the cell is not combinational, or if not
+        exactly one value of the input has this property (e.g. ``Z = OE``, where
+        both values give a constant)."""
+        cell = self.cells.get(celltype)
+        if cell is None or cell.is_sequential or cell.has_always or src_pin not in cell.inputs:
+            return None
+        ast = self.output_asts(celltype).get(dst_pin)
+        if ast is None:
+            return None
+        others = sorted(x for x in collect_ast_vars(ast) if x in cell.inputs and x != src_pin)
+        if len(others) >= TRUTH_TABLE_MAX_VARS:
+            return None
+        constant: Dict[int, int] = {}
+        for v in (0, 1):
+            outs = set()
+            for bits in itertools.product((0, 1), repeat=len(others)):
+                env = dict(zip(others, bits))
+                env[src_pin] = v
+                try:
+                    outs.add(eval_ast(ast, env) & 1)
+                except Exception:   # noqa: BLE001
+                    return None
+            if len(outs) == 1:
+                constant[v] = outs.pop()
+        if len(constant) != 1:
+            return None
+        return next(iter(constant.values()))
+
     def _comb(self, cell: Cell, src_pin: str, dst_pin: str) -> Optional[ArcSemantics]:
         ast = self.output_asts(cell.name).get(dst_pin)
         if ast is None or src_pin not in cell.inputs:

@@ -281,5 +281,5 @@ max_undriven_nets = 0
 # Keep intermediate files in build/intermediate/.
 keep_intermediates = false
 # Accept gate arcs without an SDF delay inside injection cones (pulses cannot pass them)
-# instead of failing.
+# instead of failing. The build manifest and inject count them.
 allow_missing_delays = false
