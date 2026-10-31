@@ -38,6 +38,7 @@ UPSTREAM = {"build": [], "record": [("build", "nets")],
             "inject": [("build", "graph"), ("record", "states")], "patterns": [("inject", "pulses")],
             "logic": [("build", "graph"), ("record", "states")], "analyze": [("inject", "pulses")]}
 PATTERN_FILES = ["patterns.npz", "patterns.csv"]
+GATE_REPORT = "clock_gates.json"
 INCLUDE_RE = re.compile(r'^\s*`include\s+"([^"]+)"', re.M)
 
 
@@ -213,16 +214,28 @@ def missing_outputs(cfg, stage: str) -> List[str]:
     return [n for n in need if not os.path.exists(os.path.join(d, n))]
 
 
+def _expands_clock_gates(cfg) -> bool:
+    return cfg["observe"]["clock_gates"] == "expand"
+
+
+def _upstream(cfg, stage: str) -> List[Tuple[str, str]]:
+    if stage == "patterns" and _expands_clock_gates(cfg):      # the expansion reads them
+        return UPSTREAM[stage] + [("build", "graph"), ("record", "states")]
+    return UPSTREAM[stage]
+
+
 def fingerprint(cfg, stage: str, stamps: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """What a stage's result depends on: the configuration it reads (input files by
     content) and the results of earlier stages."""
     stamps = read_stamps(cfg) if stamps is None else stamps
     conf = {f"{sec}.{key}": _content(sec, key, _value(cfg, sec, key))
             for sec, key in C.stage_keys(stage, cfg)}
+    if not _expands_clock_gates(cfg):      # results from before the key existed stay current
+        conf.pop("observe.clock_gates", None)
     if stage == "record":
         conf["workload.include_files"] = _include_files(cfg)
     upstream = {f"{up}.{name}": (stamps.get(up) or {}).get("outputs", {}).get(name)
-                for up, name in UPSTREAM[stage]}
+                for up, name in _upstream(cfg, stage)}
     return {"fingerprint": _sha({"config": conf, "upstream": upstream}), "config": conf,
             "upstream": upstream}
 
@@ -352,6 +365,27 @@ def do_inject(cfg, force: bool = True) -> None:
             print(f"[inject] removed {d}: it described the previous pulse records")
 
 
+def _write_table(cfg, pt, out: str):
+    """Write a pattern table to `out`, expanding the clock gates if configured.  Returns
+    the table and the expansion's report (None without one)."""
+    os.makedirs(out, exist_ok=True)
+    report = note = None
+    report_path = os.path.join(out, GATE_REPORT)
+    if os.path.exists(report_path):
+        os.remove(report_path)
+    if _expands_clock_gates(cfg):
+        from .analysis.clock_gates import expand_clock_gates, load_clock_gates
+        from .pipeline import state_paths
+        pt, report = expand_clock_gates(pt, load_clock_gates(paths(cfg)["build"]),
+                                        state_paths(paths(cfg)["record"])[0])
+        note = json.dumps(report)
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=1)
+    pt.save(os.path.join(out, "patterns.npz"), expansion=note)
+    pt.to_csv(os.path.join(out, "patterns.csv"))
+    return pt, report
+
+
 def do_patterns(cfg, force: bool = True) -> None:
     """The pattern table of the pulse records (setfi.analysis.patterns)."""
     steps = cfg["patterns"]["steps"]
@@ -359,6 +393,9 @@ def do_patterns(cfg, force: bool = True) -> None:
         raise SetfiCLIError("[patterns] steps is 0: set it to the number of steps of the start-time "
                             "grid, e.g. 50")
     _require(cfg, "inject", "patterns")
+    if _expands_clock_gates(cfg):
+        _require(cfg, "build", "patterns")
+        _require(cfg, "record", "patterns")
     if _skip(cfg, "patterns", force):
         return
     from .analysis.patterns import compute_patterns
@@ -366,11 +403,11 @@ def do_patterns(cfg, force: bool = True) -> None:
     t0 = time.time()
     pt = compute_patterns(paths(cfg)["inject"], steps, jobs=cfg["patterns"]["jobs"])
     out = paths(cfg)["patterns"]
-    os.makedirs(out, exist_ok=True)
-    pt.save(os.path.join(out, "patterns.npz"))
-    pt.to_csv(os.path.join(out, "patterns.csv"))
+    pt, gate_report = _write_table(cfg, pt, out)
     summary = {"patterns": pt.count, "runs": int(pt.run_site.size),
                "grid_points_with_upsets": int(pt.pattern_multiplicity.sum())}
+    if gate_report:
+        summary["clock_gates"] = gate_report["counts"]
     _finish(cfg, "patterns", fp, summary)
     print(f"[patterns] {pt.count:,} patterns from {summary['grid_points_with_upsets']:,} grid points "
           f"that upset flip-flops ({steps} steps), in {time.time() - t0:.1f}s -> {out}")
@@ -389,10 +426,11 @@ def do_logic(cfg, force: bool = True) -> None:
     fp = _begin(cfg, "logic")
     pt = run_logic(logic_spec_from_config(cfg, paths(cfg)))
     out = paths(cfg)["logic"]
-    os.makedirs(out, exist_ok=True)
-    pt.save(os.path.join(out, "patterns.npz"))
-    pt.to_csv(os.path.join(out, "patterns.csv"))
-    _finish(cfg, "logic", fp, {"patterns": pt.count, "sets_with_upsets": int(pt.pattern_multiplicity.sum())})
+    pt, gate_report = _write_table(cfg, pt, out)
+    summary = {"patterns": pt.count, "sets_with_upsets": int(pt.pattern_multiplicity.sum())}
+    if gate_report:
+        summary["clock_gates"] = gate_report["counts"]
+    _finish(cfg, "logic", fp, summary)
     print(f"[logic] -> {out}")
 
 
@@ -437,6 +475,10 @@ def do_analyze(cfg, name: Optional[str] = None, from_option: bool = False) -> Li
         except WidthModelError as e:
             where = "--width-model" if from_option else f"[analyze] width_models, entry {n + 1}"
             raise SetfiCLIError(f"{where}: {e} (the pulse records have the widths {widths})") from None
+    gate_ffs: List[int] = []
+    if _expands_clock_gates(cfg):             # observed for the patterns stage, not flip-flops
+        from .analysis.clock_gates import clock_gate_ffs, load_clock_gates
+        gate_ffs = clock_gate_ffs(load_clock_gates(paths(cfg)["build"]))
     outs = []
     for m in models:
         for note in width_model_notes(m, widths):
@@ -452,10 +494,11 @@ def do_analyze(cfg, name: Optional[str] = None, from_option: bool = False) -> Li
                 print(f"[analyze] replacing {out} (it held the width model {json.dumps(old)})")
             shutil.rmtree(out)
         analyze(paths(cfg)["inject"], out, m, phase_domain=a["phase_domain"],
-                write_trials=a["write_trials"],
+                write_trials=a["write_trials"], exclude_ffs=gate_ffs,
                 provenance={"setfi_version": __version__,
                             "pulse_records": output_digests(cfg, "inject")["pulses"],
-                            "width_model": m, "phase_domain": a["phase_domain"]})
+                            "width_model": m, "phase_domain": a["phase_domain"],
+                            **({"clock_gates_excluded": len(gate_ffs)} if gate_ffs else {})})
         print(f"[analyze] -> {out}")
         outs.append(out)
     return outs
@@ -473,7 +516,7 @@ def do_status(cfg) -> None:
             continue                  # listed once `setfi logic` has run
         ok, why = stage_status(cfg, st, stamps)
         when = (stamps.get(st) or {}).get("finished_utc", "")
-        deps = [up for up, _ in UPSTREAM[st] if up in pending]
+        deps = [up for up, _ in _upstream(cfg, st) if up in pending]
         if not ok:
             line = f"to run  ({why})"
             pending.append(st)

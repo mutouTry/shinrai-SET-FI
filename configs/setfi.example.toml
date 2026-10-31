@@ -201,6 +201,12 @@ exclude_instances = []
 # Leave flip-flops without SDF setup/hold checks unobserved instead of failing. Used by:
 # build, inject, logic.
 allow_missing_timing_checks = false
+# SETs that change what an integrated clock gate latches. ignore: not modelled, every
+# flip-flop gets the fault-free clock edge. expand: the pattern tables hold the
+# flip-flops that flip because their gate gains or loses an edge, and flip-flops without
+# a fault-free edge do not capture. Needs Liberty in library.cell_functions
+# (docs/MODEL.md). One of: ignore | expand. Used by: build, patterns, logic, analyze.
+clock_gates = "ignore"
 
 # --------------------------------------------------------------------------------------
 # How a pulse propagates through the gates. Used by: inject.

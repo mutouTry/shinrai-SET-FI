@@ -46,7 +46,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, FrozenSet, Iterable, Iterator, List, Optional
 
 import numpy as np
 
@@ -130,18 +130,20 @@ def record_windows(cols: Dict[str, np.ndarray], enter: np.ndarray, leave: np.nda
 
 @dataclass
 class Records:
-    """Read access to a records directory."""
+    """Read access to a records directory.  The FF ids in ``exclude_ffs`` are read as if
+    they were not observed."""
     root: str
     index: Dict[str, Any]
+    exclude_ffs: FrozenSet[int] = frozenset()
 
     @classmethod
-    def open(cls, root: str) -> "Records":
+    def open(cls, root: str, exclude_ffs: Iterable[int] = ()) -> "Records":
         path = os.path.join(root, "index.json")
         with open(path, "r", encoding="utf-8") as f:
             index = json.load(f)
         if index.get("format") not in READ_FORMATS:
             raise ValueError(f"{path}: not a {FORMAT} index (format={index.get('format')!r})")
-        return cls(root=root, index=index)
+        return cls(root=root, index=index, exclude_ffs=frozenset(int(f) for f in exclude_ffs))
 
     @property
     def period_ps(self) -> int:
@@ -169,7 +171,7 @@ class Records:
 
     @property
     def ffs(self) -> List[Dict[str, Any]]:
-        return list(self.index["ffs"])
+        return [f for f in self.index["ffs"] if int(f["id"]) not in self.exclude_ffs]
 
     def thresholds(self) -> tuple:
         """(enter, leave): int64 arrays of shape [2, max_id + 1] indexed [base, ff id]."""
@@ -198,7 +200,11 @@ class Records:
             if verify and md5_file(path) != ent["md5"]:
                 raise ValueError(f"{path}: md5 does not match index.json")
             with np.load(path) as d:
-                yield {k: d[k] for k in COLUMNS}
+                cols = {k: d[k] for k in COLUMNS}
+            if self.exclude_ffs:
+                keep = ~np.isin(cols["ff"], np.fromiter(self.exclude_ffs, dtype=np.int32))
+                cols = {k: v[keep] for k, v in cols.items()}
+            yield cols
 
     def load_all(self, cycles: Optional[List[int]] = None) -> Dict[str, np.ndarray]:
         parts = list(self.shards())

@@ -33,7 +33,8 @@ def _predicates(non_observed_cells: Sequence[str], observed_d_pins: Sequence[str
 
 def filter_observed(ff_index: Dict[str, Any], non_observed_cells: Sequence[str],
                     observed_d_pins: Sequence[str],
-                    non_observed_instances: Sequence[str]) -> Dict[str, Any]:
+                    non_observed_instances: Sequence[str],
+                    always_observed: Sequence[str] = ()) -> Dict[str, Any]:
     """Return a copy of ``ff_index`` whose ``ffid_to_info`` holds only observed FFs, with
     the filter's account under ``_meta.observe_filter``.
 
@@ -41,9 +42,12 @@ def filter_observed(ff_index: Dict[str, Any], non_observed_cells: Sequence[str],
       1. cell type fully matches one of ``non_observed_cells``           -> "excluded_cell"
       2. the data pin is not one of ``observed_d_pins``                  -> "non_data_pin"
       3. the instance name contains one of ``non_observed_instances``    -> "excluded_instance"
+
+    The instances in ``always_observed`` (clock gates) are kept without these predicates.
     """
     cell_res = [re.compile(p) for p in non_observed_cells]
     d_pins = set(observed_d_pins)
+    forced = set(always_observed)
     info = ff_index.get("ffid_to_info", {})
     removed: Dict[str, List[Any]] = {"excluded_cell": [], "non_data_pin": [], "excluded_instance": []}
     kept: Dict[str, Any] = {}
@@ -51,7 +55,9 @@ def filter_observed(ff_index: Dict[str, Any], non_observed_cells: Sequence[str],
         ct = e.get("celltype", "")
         dp = e.get("d_pin", "")
         inst = e.get("ff_inst", "")
-        if any(r.fullmatch(ct) for r in cell_res):
+        if inst in forced:
+            kept[ffid] = e
+        elif any(r.fullmatch(ct) for r in cell_res):
             removed["excluded_cell"].append((ffid, inst, ct))
         elif dp not in d_pins:
             removed["non_data_pin"].append((ffid, inst, dp))
@@ -68,6 +74,8 @@ def filter_observed(ff_index: Dict[str, Any], non_observed_cells: Sequence[str],
         "n_kept": len(kept),
         "n_removed": {k: len(v) for k, v in removed.items()},
     }
+    if forced:
+        meta["observe_filter"]["n_clock_gates_kept"] = len(forced)
     out.pop("_meta", None)
     out["_meta"] = meta
     return out

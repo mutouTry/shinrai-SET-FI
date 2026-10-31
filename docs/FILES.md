@@ -26,9 +26,23 @@ the other stages refer to these numbers.
 | `timing_checks.json` | per flip-flop: its SDF setup and hold (and recovery, removal) checks |
 | `delay_table.npz`, `arc_index.json` | rise and fall delay of every instance arc, with its SDF `COND` alternatives. `arc_index.json` gives each arc's row |
 | `interconnect.json` | only if the SDF has `INTERCONNECT`: wire delay per load pin |
+| `clock_gates.json` | only with `observe.clock_gates = "expand"`: see below |
 | `cell_functions.v` | only for Liberty (or several) `library.cell_functions`: the cells as Verilog modules |
 | `build_manifest.json` | input checksums, counts, check results, and SDF entries that are not used, by reason. With `build.allow_missing_delays`, `arcs_without_delay` counts the gate arcs inside the fan-out cones that have no SDF delay (only if there are any) |
 | `intermediate/` | only with `build.keep_intermediates` |
+
+`clock_gates.json` (format `setfi-clock-gates/1`) describes the integrated clock
+gates (docs/MODEL.md):
+
+| Key | Content |
+|---|---|
+| `gates` | one entry per modelled gate, parents before the gates behind them: `inst`, `celltype`, `type`, `ffid`, `enable_net_idx`, `test_net_idx`, `parent`, and its clock fan-out through combinational cells: `ffs` (flip-flop ids), `gates` (gates in series), `blackbox_pins`, `other_edge` (cells that do not sample its rising edge), `through_logic` (how many of them are reached through cells with other inputs) |
+| `ffs` | per flip-flop id behind a gate: `inst`, `celltype`, `gate`, `d_net_idx`, `q_net_idx`, `q_inverted`, `async` (pairs of net and active level), `observed`, and `next_nets` for cells that do not just load the data pin (the nets of the other inputs of the next value, -1 and -2 for inputs tied to 0 and 1, -3 for the stored value) |
+| `next_tables` | per such cell type: the next value, indexed by the data pin plus twice the bits of `next_nets`, first entry lowest |
+| `several_gates` | cells behind more than one gate, which belong to none |
+| `unmodelled_gates` | gates of other types |
+| `other_clock_sources` | other sequential cells that drive a clock pin, with `n_clocked` |
+| `summary` | the counts, also in `build_manifest.json` |
 
 ## record/
 
@@ -111,6 +125,17 @@ pattern add up to its multiplicity. `patterns.csv` has one row per pattern,
 `patterns.npz`, `ffs` its flip-flop ids separated by `|`). `src/setfi/analysis/patterns.py`
 reads the format.
 
+With `observe.clock_gates = "expand"` the table holds the sets F' of docs/MODEL.md,
+in the same format. `ff_ids` and `ff_instances` then leave out the gates and add the
+flip-flops behind a gate that have no capture window. The stage also writes
+`clock_gates.json` (format `setfi-clock-gate-expansion/1`), which `patterns.npz` holds
+as one more array, `expansion`: the patterns and grid points before and after, and in
+`counts`, as patterns and grid points, `gate_in_F`, `edge_change`, `no_edge_change`,
+`test_enable_on`, `no_fault_free_edge` (an entry of F dropped for lack of an edge),
+`empty` (F' is empty) and the cases in `exceptions`. `blackbox_clock_by_gate` lists the
+gates with a black box in the clock fan-out. `gates_without_capture_window` lists gates
+that have no setup and hold checks, whose enable therefore cannot be captured.
+
 ## logic/
 
 Written by `setfi logic`: `patterns.npz` and `patterns.csv` in the format of
@@ -129,7 +154,8 @@ has no start times and no pulse widths, and holds neutral values for them:
 
 Each run is one site, so `pattern_multiplicity` and `pattern_n_sites` both
 count the sites that give the pattern, and `Patterns.grid_points()` has one row
-per (cycle, site) whose SET changes a data pin.
+per (cycle, site) whose SET changes a data pin. With `observe.clock_gates =
+"expand"` the table is rewritten and reported as in `patterns/`.
 
 ## analyze/\<name\>/
 
@@ -140,6 +166,9 @@ per (cycle, site) whose SET changes a data pin.
 | `per_site.csv` | probability that a SET at a site upsets a flip-flop |
 | `per_width.csv` | upset probability for each injected width |
 | `trial_exposure.npz` | only with `analyze.write_trials`: one row per trial that can upset a flip-flop (`cycle`, `site` as an index into `site_names`, `width_ps`, `exposure_ps` > 0). All other trials have exposure 0 |
+
+With `observe.clock_gates = "expand"` the gates are left out of these results
+(`provenance.clock_gates_excluded` in `summary.json` counts them).
 
 The directory is named after the width model (`uniform`,
 `gaussian_mean90_sd40`, `table_<hash>`, with the suffix `_closed` for the

@@ -9,7 +9,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import checks, graph, netlist, observe, timing
+from . import checks, clock_gates, graph, netlist, observe, timing
 from .celllib import CellFunctions, check_used_cells, is_structurally_untimed, parse_library
 from .spec import BuildError, BuildSpec
 
@@ -18,7 +18,8 @@ log = logging.getLogger("setfi.build")
 MANIFEST_NAME = "build_manifest.json"
 INTERMEDIATE_DIR = "intermediate"
 
-# What the campaign reads.  interconnect is written only when the SDF has INTERCONNECT records.
+# What the campaign reads.  interconnect is written only when the SDF has INTERCONNECT records,
+# clock_gates only with observe.clock_gates = "expand".
 CONTRACT_FILES = (
     "net_index.json",
     "site_cones.jsonl",
@@ -30,6 +31,7 @@ CONTRACT_FILES = (
     "delay_table.npz",
     "arc_index.json",
     "interconnect.json",
+    "clock_gates.json",
 )
 
 MANIFEST_FORMAT = 1
@@ -257,9 +259,19 @@ def _build(spec: BuildSpec, out_dir: str) -> Dict[str, Any]:
                              "= true to let pulses stop at these arcs.")
 
     # ---- observed FFs ----
+    gates: Optional[Dict[str, Any]] = None
+    if spec.clock_gate_cells is not None:
+        gates = clock_gates.analyze_clock_gates(insts, cells, funcs, elab.blackboxes, spec.clock_gate_cells,
+                                                g.ff_index, g.net_to_idx)
     ffx = observe.filter_observed(g.ff_index, lspec.non_observed_cells,
-                                  lspec.observed_d_pins, spec.non_observed_instances)
+                                  lspec.observed_d_pins, spec.non_observed_instances,
+                                  always_observed=[r["inst"] for r in gates["gates"]] if gates else ())
     _dump(ffx, os.path.join(out_dir, "ff_index.json"), indent=2)
+    if gates:
+        for ffid, e in gates["ffs"].items():
+            e["observed"] = ffid in ffx["ffid_to_info"]
+        _dump(gates, os.path.join(out_dir, "clock_gates.json"), ensure_ascii=False)
+        log.info("clock gates: %s", gates["summary"])
     obs = dict(ffx["_meta"]["observe_filter"])
     obs["removed_examples"] = observe.removed_examples(g.ff_index, ffx)
 
@@ -306,6 +318,8 @@ def _build(spec: BuildSpec, out_dir: str) -> Dict[str, Any]:
         "warnings": warnings,
         "elapsed_s": round(time.time() - t0, 3),
     }
+    if gates:
+        manifest["clock_gates"] = gates["summary"]
     if no_delay:      # accepted with build.allow_missing_delays
         manifest["arcs_without_delay"] = {
             "about": "gate arcs inside injection cones without an SDF delay; pulses do not "

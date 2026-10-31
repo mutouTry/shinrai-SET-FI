@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, fields
-from typing import Any, Dict, Mapping, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 class BuildError(RuntimeError):
@@ -157,6 +157,10 @@ class BuildSpec:
     # FF instances whose name contains one of these substrings are not observed
     # (synthesis-inserted clock-gating registers).
     non_observed_instances: Tuple[str, ...] = ()
+    # observe.clock_gates = "expand": the integrated clock-gating cells of the library
+    # (cell -> type, clock, enable, test, out, from Liberty).  They are observed through
+    # their enable pin and clock_gates.json is written.  None: neither.
+    clock_gate_cells: Optional[Dict[str, Dict[str, Any]]] = None
 
     # ---- self-check: rebuild this many sampled cones by plain BFS and compare ----
     self_check: bool = True

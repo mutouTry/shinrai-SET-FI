@@ -73,10 +73,10 @@ STAGE_KEYS = {
                ("fault_model", "pulse_widths_ps"), ("fault_model", "sites"),
                ("library", "timing_check_clock_pins"),
                ("observe", "allow_missing_timing_checks")],
-    "patterns": ["patterns"],
+    "patterns": ["patterns", ("observe", "clock_gates")],
     "logic": ["logic", ("fault_model", "sites"), ("library", "timing_check_clock_pins"),
-              ("observe", "allow_missing_timing_checks")],
-    "analyze": ["analyze"],
+              ("observe", "allow_missing_timing_checks"), ("observe", "clock_gates")],
+    "analyze": ["analyze", ("observe", "clock_gates")],
 }
 # Keys that change how a stage runs, not its result.
 EXECUTION_ONLY = {("inject", "jobs"), ("inject", "cycles_per_shard"), ("patterns", "jobs"),
@@ -299,6 +299,12 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
         "allow_missing_timing_checks": _k("bool", False,
                                           "Leave flip-flops without SDF setup/hold checks "
                                           "unobserved instead of failing."),
+        "clock_gates": _k("choice:ignore|expand", "ignore",
+                          "SETs that change what an integrated clock gate latches. ignore: not "
+                          "modelled, every flip-flop gets the fault-free clock edge. expand: the "
+                          "pattern tables hold the flip-flops that flip because their gate gains "
+                          "or loses an edge, and flip-flops without a fault-free edge do not "
+                          "capture. Needs Liberty in library.cell_functions (docs/MODEL.md)."),
     },
     "build": {
         "self_check": _k("bool", True, "Verify a sample of fan-out cones by direct traversal."),

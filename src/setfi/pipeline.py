@@ -146,11 +146,12 @@ def workload_spec_from_config(cfg, paths: Dict[str, str]):
         compile_timeout_s=wl["compile_timeout_s"], sim_timeout_s=wl["sim_timeout_s"])
 
 
-def cell_function_file(cfg, out_dir: str, log=print) -> str:
+def cell_function_file(cfg, out_dir: str, log=print, clock_gates=None) -> str:
     """The single assign-style Verilog file the build reads.
 
     One Verilog file is used as it is.  Liberty files are translated, and several
-    files are concatenated, into <out_dir>/cell_functions.v.
+    files are concatenated, into <out_dir>/cell_functions.v.  ``clock_gates``, a dict,
+    receives the pin roles of the integrated clock gates that Liberty declares.
     """
     files = cfg["library"]["cell_functions"]
     is_lib = [is_liberty(f) for f in files]
@@ -164,6 +165,10 @@ def cell_function_file(cfg, out_dir: str, log=print) -> str:
             n_bad = sum(1 for m in models.values() if m.kind == "unsupported")
             log(f"[library] {f}: {len(models)} cells, {n_bad} not modelled")
             parts.append(text)
+            if clock_gates is not None:
+                for m in models.values():
+                    if m.clock_gate:
+                        clock_gates.setdefault(m.name, m.clock_gate)
         else:
             with open(f, "r", encoding="utf-8", errors="replace") as fh:
                 parts.append(fh.read())
@@ -176,12 +181,19 @@ def cell_function_file(cfg, out_dir: str, log=print) -> str:
 
 def build_spec_from_config(cfg, paths: Dict[str, str], log=print):
     from .build import BuildSpec, LibrarySpec
+    from .config import ConfigError
     lib = cfg["library"]
     obs = cfg["observe"]
     b = cfg["build"]
     fm = cfg["fault_model"]
+    gate_cells = None
+    if obs["clock_gates"] == "expand":
+        if not any(is_liberty(f) for f in lib["cell_functions"]):
+            raise ConfigError("observe.clock_gates = \"expand\" finds clock gates in Liberty: list a "
+                              ".lib file in library.cell_functions")
+        gate_cells = {}
     lspec = LibrarySpec(
-        behavioral_verilog=cell_function_file(cfg, paths["build"], log),
+        behavioral_verilog=cell_function_file(cfg, paths["build"], log, clock_gates=gate_cells),
         q_pin_names=tuple(lib["q_pins"]), d_pin_names=tuple(lib["d_pins"]),
         clock_pin_names=tuple(lib["clock_pins"]), async_pin_names=tuple(lib["async_pins"]),
         mirror_scan_data_checks=lib["mirror_scan_data_checks"],
@@ -194,7 +206,8 @@ def build_spec_from_config(cfg, paths: Dict[str, str], log=print):
         netlist=d["netlist"], sdf=d["sdf"], top=d["top"], out_dir=paths["build"], library=lspec,
         exclude_d_from_src=not fm["inject_ff_d_nets"],
         sdf_rail=cfg["propagation"]["sdf_rail"],
-        non_observed_instances=tuple(obs["exclude_instances"]), self_check=b["self_check"],
+        non_observed_instances=tuple(obs["exclude_instances"]), clock_gate_cells=gate_cells,
+        self_check=b["self_check"],
         self_check_samples=b["self_check_samples"], self_check_seed=b["self_check_seed"],
         strict_sdf_crosscheck=b["strict_sdf_crosscheck"], max_undriven_nets=b["max_undriven_nets"],
         keep_intermediates=b["keep_intermediates"], allow_missing_delays=b["allow_missing_delays"])

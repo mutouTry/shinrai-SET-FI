@@ -15,7 +15,7 @@ from __future__ import annotations
 import csv
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 
@@ -26,8 +26,9 @@ from .widths import width_weights
 
 def analyze(records_dir: str, out_dir: str, width_model: Dict[str, Any],
             phase_domain: str = "half_open", write_trials: bool = False,
-            provenance: Optional[Dict[str, Any]] = None, log=print) -> Dict[str, Any]:
-    rec = Records.open(records_dir)
+            provenance: Optional[Dict[str, Any]] = None, log=print,
+            exclude_ffs: Sequence[int] = ()) -> Dict[str, Any]:
+    rec = Records.open(records_dir, exclude_ffs=exclude_ffs)
     weights = width_weights(width_model, rec.pulse_widths_ps)
     tot = accumulate(rec, weights, phase_domain=phase_domain, keep_trials=write_trials)
     summary = summarize(rec, tot, width_model, phase_domain)

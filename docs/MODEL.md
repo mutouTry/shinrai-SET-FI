@@ -128,11 +128,73 @@ recorded value is upset. There is no inertial filtering and no capture window,
 and paths that reconverge give the steady value, not a glitch. The result is
 the set F of upset flip-flops per (cycle, site).
 
+## Clock gates
+
+By default (`observe.clock_gates = "ignore"`) an integrated clock gate is not an
+observation point and every flip-flop gets the fault-free clock edge. A SET that
+changes what the gate latches is then not in F, and a flip-flop whose gate is
+off in the fault-free run can still be in F.
+
+With `"expand"`, the gates of the Liberty types `latch_posedge*` are observed
+through their enable pin, with the setup and hold of that pin against the gate's
+clock. A pulse changes the latched value when it overlaps that window. A pulse
+that ends earlier, while the latch is still transparent, leaves no trace. F then
+holds gates as well as flip-flops, and the `patterns` and `logic` stages rewrite
+each (cycle, F) into (cycle, F'), which holds flip-flops only.
+
+For each flip-flop, E0 and E1 tell whether it gets an edge at `T` without and
+with the SET. Each is the product of the enables on its clock path, with an
+enable inverted if F holds that gate. An enable is the enable pin ORed with the
+test-enable pin, so a flipped enable has no effect while test enable is 1. D and
+Q are read from the recorded state of the cycle.
+
+| E0 | E1 | The flip-flop is in F' when | |
+|---|---|---|---|
+| 1 | 1 | it is in F | the normal case |
+| 0 | 0 | not in F' | it has no edge, also if it is in F |
+| 0 | 1 | (D XOR it is in F) differs from Q | an extra edge captures D under the SET |
+| 1 | 0 | D differs from Q | the edge is lost, so a SET on D has no effect |
+
+Gates in series follow from the product: a flip upstream changes the groups
+behind the gates whose own enable is 1. After `T` nothing of the SET is left,
+because the latch is transparent again in the low phase of the next cycle.
+
+Grid points whose F' is empty belong to no pattern, and the report counts them.
+Equal (cycle, F') are merged with their runs joined, in the usual table format.
+`analyze` works from the pulse records and leaves the gates out, so its
+results are those of `"ignore"` and do not include the flip-flops that only a
+clock-edge change flips.
+
+The rewrite was compared with an SDF-annotated gate-level simulation on one small
+processor netlist, at 1,300 trials. Gates in series are covered by unit tests
+only, since that netlist has none.
+
+What F' does not express is left as it is and reported, per pattern in
+`clock_gates.json` of the stage and per design in `build/clock_gates.json`:
+
+* A gate with a memory or another black box in its clock fan-out. An edge more or
+  less is a memory operation more or less, not a flip-flop flip.
+* An enable, D or Q recorded as X or Z. It is read as 0, like elsewhere in setfi.
+* Cells behind a gate that do not sample its rising edge (latches, the falling
+  edge), and cells behind several gates. Their entries in F stay.
+* A flip-flop in F' from a gate whose asynchronous set or reset is active in the
+  recorded state, and a flip-flop that would flip but is not observed.
+* Gates of other Liberty types, and other sequential cells that drive a clock
+  pin, such as a latch ANDed with the clock or a register-generated clock. They
+  are counted by the build. The flip-flops behind them are treated as clocked.
+
+F' can hold flip-flops that an injection tool cannot reach, for example those
+outside a scan chain. setfi does not know the chains, so that is for the tool
+that reads the table. In the table above, D stands for the value the edge would
+load, from the cell's model: the data pin through a scan mux or a synchronous
+clear, if the cell has one. Entries of F still come from the data pin alone.
+
 ## Scope
 
 * One SET per trial, on one net. Every site has the same weight.
 * An error is a wrong value captured at a flip-flop data pin. Pulses that reach
-  only clock, clock-enable or asynchronous set/reset pins are not counted.
+  only clock, clock-enable or asynchronous set/reset pins are not counted, apart
+  from integrated clock gates with `observe.clock_gates = "expand"`.
 * Every flip-flop captures at the same instant `T`. Clock-tree delays in the
   SDF are not used.
 * Only the SDF arcs inside the fan-out cones of the sites are used.

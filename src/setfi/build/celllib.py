@@ -660,6 +660,88 @@ def _extract_async_branch(always_text: str, state_reg: str) -> Optional[Tuple[st
     return m.group(1), parse_verilog_const(m.group(2))
 
 
+@dataclass
+class SeqTraits:
+    """How a sequential cell samples, from its model."""
+    edge: Optional[str]                  # posedge | negedge of the clock pin; None: level-sensitive
+    q_pin: Optional[str]                 # the state output
+    q_inverted: bool                     # it holds the inverse of the sampled value
+    async_pins: Tuple[Tuple[str, int], ...]     # (pin, level at which it overrides the clock)
+    # The value loaded at the edge when it is not just the data pin (scan mux, synchronous
+    # clear, ...): next_table[data pin + 2 * (bits of next_pins, first pin lowest)].  A name
+    # in next_pins that is not an input of the cell is the stored value.
+    next_pins: Tuple[str, ...] = ()
+    next_table: Optional[Tuple[int, ...]] = None
+
+
+def _next_state(cell: Cell, state: Set[str], parsed: Dict[str, AstNode]
+                ) -> Tuple[Tuple[str, ...], Optional[Tuple[int, ...]]]:
+    if not cell.d_pins:
+        return (), None
+    inputs = set(cell.inputs)
+    d = cell.d_pins[0]
+    for ab in cell.always_blocks:
+        if not _extract_always_event_list(ab):
+            continue
+        for reg in sorted(state):
+            rhs = _extract_seq_assignment_rhs(ab, reg)
+            if rhs is None:
+                continue
+            try:
+                ast = parse_assign_expr_to_ast(rhs)
+                memo: Dict[str, Optional[AstNode]] = {}
+                repl = {v: _resolve_assign_ast(v, parsed, inputs, memo) for v in collect_ast_vars(ast)}
+                ast = substitute_ast(ast, {v: a for v, a in repl.items() if a is not None})
+                names = collect_ast_vars(ast)
+                pins = tuple(sorted(v for v in names if v != d))
+                if not pins and d in names and len(rhs.strip("() ")) == len(d):
+                    return (), None
+                if len(pins) >= TRUTH_TABLE_MAX_VARS:
+                    return (), None
+                table = []
+                for bits in itertools.product((0, 1), repeat=len(pins)):
+                    env = dict(zip(pins, reversed(bits)))
+                    table += [eval_ast(ast, {**env, d: v}) & 1 for v in (0, 1)]
+            except Exception:   # noqa: BLE001
+                return (), None
+            return pins, tuple(table)
+    return (), None
+
+
+def sequential_traits(cell: Cell) -> SeqTraits:
+    parsed, _ = _parse_assigns(cell)
+    inputs = set(cell.inputs)
+    edge = None
+    asyncs: List[Tuple[str, int]] = []
+    state: Set[str] = set()
+    for ab in cell.always_blocks:
+        state.update(re.findall(r"\b([A-Za-z_]\w*)\s*<=", ab))
+        evs = [_map_internal_event_to_external(sig, e, parsed, inputs)
+               for e, sig in _extract_always_event_list(ab)]
+        if evs and edge is None:
+            edge = evs[0][1]
+            asyncs = [(pin, 1 if e == "posedge" else 0) for pin, e in evs[1:]]
+    next_pins, next_table = _next_state(cell, state, parsed)
+
+    def polarity(pin: str) -> Optional[bool]:
+        if pin in state:
+            return False
+        rhs = cell.assigns.get(pin, "").replace(" ", "")
+        while rhs.startswith("(") and rhs.endswith(")"):
+            rhs = rhs[1:-1]
+        if rhs in state:
+            return False
+        if rhs[:1] in ("!", "~") and rhs[1:].strip("()") in state:
+            return True
+        return None
+
+    for pin in cell.q_pins:
+        inverted = polarity(pin)
+        if inverted is not None:
+            return SeqTraits(edge, pin, inverted, tuple(asyncs), next_pins, next_table)
+    return SeqTraits(edge, None, False, tuple(asyncs), next_pins, next_table)
+
+
 class CellFunctions:
     """Arc semantics of library cells, memoised per (cell type, src pin, dst pin).
 

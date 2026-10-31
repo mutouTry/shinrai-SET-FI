@@ -46,6 +46,10 @@ and the grid: not on how the records are split into files, nor on ``jobs``.
 The logic stage (setfi.campaign.logic) writes tables of the same format without
 a grid or widths: steps = 0, one run per site.
 
+With observe.clock_gates = "expand" the table is rewritten by
+setfi.analysis.clock_gates.  The format stays, and the array `expansion` (str,
+JSON) says how it was rewritten.
+
     from setfi.analysis.patterns import compute_patterns
     pt = compute_patterns("runs/my_top/inject", steps=50)
     print(pt.count, pt.cycle(0), pt.ffs(0), pt.sources(0)[:3])
@@ -181,10 +185,12 @@ class Patterns:
         for i, (c, m, s) in enumerate(rows):
             yield [a + i, c, m, ptr[i + 1] - ptr[i], s, "|".join(map(str, ffs[ptr[i]:ptr[i + 1]]))]
 
-    def save(self, path: str) -> None:
-        """Write the table to `path` (patterns.npz, compressed)."""
+    def save(self, path: str, expansion: Optional[str] = None) -> None:
+        """Write the table to `path` (patterns.npz, compressed).  `expansion` (a JSON
+        text, setfi.analysis.clock_gates) is kept as one more array, which load ignores."""
         tmp = path + ".tmp.npz"
-        np.savez_compressed(tmp, format=np.asarray(FORMAT),
+        extra = {} if expansion is None else {"expansion": np.asarray(expansion)}
+        np.savez_compressed(tmp, format=np.asarray(FORMAT), **extra,
                             **{f.name: np.asarray(getattr(self, f.name)) for f in fields(self)})
         os.replace(tmp, path)
 

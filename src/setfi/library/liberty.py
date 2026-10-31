@@ -257,6 +257,7 @@ class CellModel:
     verilog: Optional[str]
     kind: str            # comb | ff | latch | icg | tie | physical | unsupported
     reason: str = ""
+    clock_gate: Optional[Dict[str, Optional[str]]] = None   # icg: type, clock, enable, test, out
 
 
 def _strip_parens(e: str) -> str:
@@ -424,7 +425,9 @@ def _icg_to_verilog(name: str, cell: Group, pins: List[Group], inputs: List[str]
              "    end",
              f"    assign {g} = {c} & {held};" if pos else f"    assign {g} = {c} | (!{held});",
              "endmodule"]
-    return CellModel(name, "\n".join(lines), "icg")
+    return CellModel(name, "\n".join(lines), "icg",
+                     clock_gate={"type": kind, "clock": c, "enable": e, "test": te[0] if te else None,
+                                 "out": g})
 
 
 def liberty_to_verilog(paths: List[str]) -> Tuple[str, Dict[str, CellModel]]:

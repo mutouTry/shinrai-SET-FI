@@ -32,6 +32,20 @@ def read_cycle_bits(state_dir: str, cycle: int, n_nets: int) -> np.ndarray:
     return np.unpackbits(raw, bitorder="little")[:n_nets].astype(np.uint8)
 
 
+def read_cycle_unknown(state_dir: str, cycle: int, n_nets: int) -> np.ndarray:
+    """1 for the nets recorded as X or Z.  The file marks them per hex digit, so a digit
+    that is only partly unknown marks all four of its nets."""
+    path = os.path.join(state_dir, f"cycle_{int(cycle)}.hex")
+    if not os.path.exists(path):
+        raise StateError(f"recorded state for cycle {cycle} is missing: {path}")
+    with open(path, "r", encoding="ascii") as f:
+        hex_str = f.read().strip()
+    digits = "".join("f" if ch in "xXzZ" else "0" for ch in hex_str)
+    val = (int(digits, 16) if digits else 0) & ((1 << n_nets) - 1)
+    raw = np.frombuffer(val.to_bytes((n_nets + 7) // 8, "little"), dtype=np.uint8)
+    return np.unpackbits(raw, bitorder="little")[:n_nets].astype(np.uint8)
+
+
 def read_sampled_cycles(meta_path: str) -> List[int]:
     """The sampled cycles listed in the record stage's cycles.json."""
     with open(meta_path, "r", encoding="utf-8") as f:
